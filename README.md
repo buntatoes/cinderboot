@@ -53,6 +53,11 @@ make test
 make package
 ```
 
+## Contributing & Security
+
+- **Contributing**: See [CONTRIBUTING.md](CONTRIBUTING.md) for the contributor notice, zero-dependency policy, and PR guidelines.
+- **Security**: Report vulnerabilities privately via [GitHub Security Advisories](https://github.com/buntatoes/cinderboot/security/advisories/new) (see [SECURITY.md](SECURITY.md)).
+
 ## License
 
 Source code is licensed under **GNU GPL-3.0** ([LICENSE](LICENSE)) — by **Buntato**.
