@@ -180,7 +180,7 @@ func (f *FATReader) walkDirData(dirData []byte, prefix string, depth int, maxFil
 			continue
 		}
 		attr := rec[11]
-		if attr == 0x0F { // VFAT Long File Name entry
+		if (attr & 0x3F) == 0x0F { // VFAT Long File Name entry
 			lfnParts = append(lfnParts, decodeLFNChunk(rec))
 			continue
 		}

@@ -4,6 +4,7 @@ package image
 import (
 	"io"
 	"path"
+	"sort"
 	"strings"
 )
 
@@ -11,7 +12,8 @@ import (
 type DistroFamily string
 
 const (
-	DistroUbuntu   DistroFamily = "ubuntu"   // Ubuntu, Mint, Pop!_OS, Zorin, Elementary (casper)
+	DistroPopOS    DistroFamily = "pop-os"   // Pop!_OS (casper with custom casper_* dir & systemd-boot/isolinux)
+	DistroUbuntu   DistroFamily = "ubuntu"   // Ubuntu, Mint, Zorin, Elementary (casper)
 	DistroFedora   DistroFamily = "fedora"   // Fedora, Rocky, Alma, Nobara, Bazzite (dracut)
 	DistroVoid     DistroFamily = "void"     // Void Linux (dracut void-live)
 	DistroArch     DistroFamily = "arch"     // Arch, EndeavourOS, CachyOS, Garuda (archiso)
@@ -25,10 +27,11 @@ const (
 type LinuxBootProfile struct {
 	Family      DistroFamily
 	DisplayName string
-	KernelPath  string   // e.g. "/casper/vmlinuz"
+	KernelPath  string   // e.g. "/casper/vmlinuz" or "/casper_pop-os_.../vmlinuz.efi"
 	InitrdPaths []string // e.g. ["/boot/intel_ucode.img", "/casper/initrd"]
-	KernelArgs  string   // base args parsed from ISO grub.cfg / loader conf (without PARTUUID yet)
+	KernelArgs  string   // base args parsed from ISO grub.cfg / loader conf / isolinux.cfg (without PARTUUID yet)
 	ISOGrubCfg  string   // path to ISO's own grub.cfg if present (for configfile fallback)
+	CasperDir   string   // casper live directory inside ISO (e.g. "/casper_pop-os_22.04_amd64_intel_42")
 	VolumeLabel string
 	FSUUID      string // GRUB2 ISO9660 timestamp UUID
 }
@@ -36,6 +39,13 @@ type LinuxBootProfile struct {
 // DetectLinuxBoot inspects an ISO9660 filesystem to determine its distro family,
 // kernel/initrd paths, and base kernel parameters for multi-partition GRUB2 multiboot.
 func DetectLinuxBoot(isoFS ImageFS, fileName, volumeLabel, fsUUID string) LinuxBootProfile {
+	return DetectLinuxBootWithEFI(isoFS, nil, fileName, volumeLabel, fsUUID)
+}
+
+// DetectLinuxBootWithEFI inspects an ISO9660 filesystem together with any files extracted
+// from its appended EFI System Partition (such as Pop!_OS systemd-boot loader/entries/*.conf)
+// to determine its distro family, exact ISO9660 kernel/initrd paths, and base kernel arguments.
+func DetectLinuxBootWithEFI(isoFS ImageFS, efiFiles map[string][]byte, fileName, volumeLabel, fsUUID string) LinuxBootProfile {
 	prof := LinuxBootProfile{
 		Family:      DistroGeneric,
 		DisplayName: cleanDistroDisplayName(volumeLabel, fileName),
@@ -46,20 +56,38 @@ func DetectLinuxBoot(isoFS ImageFS, fileName, volumeLabel, fsUUID string) LinuxB
 		return prof
 	}
 
-	filesLower := make(map[string]string) // lowercase path -> exact ISO path
+	filesLower := make(map[string]string) // lowercase path -> exact ISO path with leading "/"
 	var allFiles []string
 	_ = isoFS.Walk(func(e Entry) error {
 		if !e.IsDir {
-			lp := strings.ToLower(e.Path)
+			lp := strings.ToLower(strings.TrimPrefix(e.Path, "/"))
 			filesLower[lp] = "/" + strings.TrimPrefix(e.Path, "/")
 			allFiles = append(allFiles, lp)
 		}
 		return nil
 	})
+	sort.Strings(allFiles)
+
+	efiLower := make(map[string][]byte, len(efiFiles))
+	efiKeys := make([]string, 0, len(efiFiles))
+	for k, v := range efiFiles {
+		lp := strings.ToLower(strings.TrimPrefix(strings.ReplaceAll(k, `\`, "/"), "/"))
+		efiLower[lp] = v
+		efiKeys = append(efiKeys, lp)
+	}
+	sort.Strings(efiKeys)
 
 	hasFile := func(lp string) (string, bool) {
 		p, ok := filesLower[lp]
 		return p, ok
+	}
+	resolveISOPath := func(p string) (string, bool) {
+		norm := strings.ToLower(strings.TrimPrefix(strings.ReplaceAll(strings.TrimSpace(p), `\`, "/"), "/"))
+		if norm == "" {
+			return "", false
+		}
+		exact, ok := filesLower[norm]
+		return exact, ok
 	}
 	findFirst := func(prefixes []string, contains string) string {
 		for _, lp := range allFiles {
@@ -71,8 +99,28 @@ func DetectLinuxBoot(isoFS ImageFS, fileName, volumeLabel, fsUUID string) LinuxB
 		}
 		return ""
 	}
+	findInCasperDir := func(contains string) string {
+		for _, lp := range allFiles {
+			slash := strings.IndexByte(lp, '/')
+			if slash <= 0 {
+				continue
+			}
+			topDir := lp[:slash]
+			if topDir != "casper" && !strings.HasPrefix(topDir, "casper_") && !strings.HasPrefix(topDir, "casper-") {
+				continue
+			}
+			base := lp[slash+1:]
+			if strings.Contains(base, "/") || isMetadataSidecar(base) {
+				continue
+			}
+			if contains == "" || strings.Contains(base, contains) {
+				return filesLower[lp]
+			}
+		}
+		return ""
+	}
 
-	// Locate ISO's own grub.cfg (if any) to parse authentic kernel/initrd/cmdline flags.
+	// 1. Locate ISO's own grub.cfg (if any) to parse authentic kernel/initrd/cmdline flags.
 	grubCandidates := []string{
 		"boot/grub/grub.cfg",
 		"boot/grub2/grub.cfg",
@@ -92,12 +140,10 @@ func DetectLinuxBoot(isoFS ImageFS, fileName, volumeLabel, fsUUID string) LinuxB
 			}
 		}
 	}
-
-	// Check systemd-boot loader entries (Arch, Pop!_OS, EndeavourOS, CachyOS).
 	if prof.KernelPath == "" {
-		for _, lp := range allFiles {
-			if strings.HasPrefix(lp, "loader/entries/") && strings.HasSuffix(lp, ".conf") {
-				if k, inits, args := parseSystemdBootEntry(readISOFileText(isoFS, strings.TrimPrefix(filesLower[lp], "/"))); k != "" {
+		for _, cand := range grubCandidates {
+			if raw, ok := efiLower[cand]; ok {
+				if k, inits, args := parseFirstGrubEntry(string(raw)); k != "" {
 					prof.KernelPath = k
 					prof.InitrdPaths = inits
 					prof.KernelArgs = args
@@ -107,12 +153,116 @@ func DetectLinuxBoot(isoFS ImageFS, fileName, volumeLabel, fsUUID string) LinuxB
 		}
 	}
 
-	// Detect distro family from characteristic files & volume label.
+	// 2. Check systemd-boot loader entries in both ISO9660 and the appended FAT ESP
+	// (Pop!_OS, Arch, EndeavourOS, CachyOS).
+	if prof.KernelPath == "" {
+		type loaderCandidate struct {
+			name string
+			text string
+		}
+		var loaders []loaderCandidate
+		for _, lp := range allFiles {
+			if strings.HasPrefix(lp, "loader/entries/") && strings.HasSuffix(lp, ".conf") {
+				loaders = append(loaders, loaderCandidate{
+					name: path.Base(lp),
+					text: readISOFileText(isoFS, strings.TrimPrefix(filesLower[lp], "/")),
+				})
+			}
+		}
+		for _, lp := range efiKeys {
+			if strings.HasPrefix(lp, "loader/entries/") && strings.HasSuffix(lp, ".conf") {
+				loaders = append(loaders, loaderCandidate{
+					name: path.Base(lp),
+					text: string(efiLower[lp]),
+				})
+			}
+		}
+		// Prioritize primary live entries ahead of recovery/fallback/memtest entries.
+		sort.SliceStable(loaders, func(i, j int) bool {
+			return loaderEntryPriority(loaders[i].name) < loaderEntryPriority(loaders[j].name)
+		})
+		for _, cand := range loaders {
+			if k, inits, args := parseSystemdBootEntry(cand.text); k != "" {
+				prof.KernelPath = k
+				prof.InitrdPaths = inits
+				prof.KernelArgs = args
+				break
+			}
+		}
+	}
+
+	// 3. Check ISOLINUX / SYSLINUX configs (Pop!_OS, Debian/Ubuntu derivatives without grub.cfg).
+	if prof.KernelPath == "" {
+		isoLinuxCandidates := []string{
+			"isolinux/isolinux.cfg",
+			"isolinux/live.cfg",
+			"isolinux/txt.cfg",
+			"syslinux/syslinux.cfg",
+			"boot/syslinux/syslinux.cfg",
+		}
+		visited := make(map[string]bool)
+		for _, cand := range isoLinuxCandidates {
+			if k, inits, args := parseIsolinuxConfig(isoFS, filesLower, cand, visited, 0); k != "" {
+				prof.KernelPath = k
+				prof.InitrdPaths = inits
+				prof.KernelArgs = args
+				break
+			}
+		}
+	}
+
+	// Validate parsed kernel & initrd paths against the ISO9660 filesystem so ESP-relative
+	// paths (from efi.img loader/entries/*.conf) are safely resolved to actual ISO9660 paths
+	// while preserving authentic KernelArgs (e.g. modules_load=nvidia, live-media-path=...).
+	if prof.KernelPath != "" {
+		if exact, ok := resolveISOPath(prof.KernelPath); ok {
+			prof.KernelPath = exact
+		} else {
+			prof.KernelPath = ""
+			prof.InitrdPaths = nil
+		}
+	}
+	if len(prof.InitrdPaths) > 0 {
+		resolved := make([]string, 0, len(prof.InitrdPaths))
+		allOK := true
+		for _, initrd := range prof.InitrdPaths {
+			if exact, ok := resolveISOPath(initrd); ok {
+				resolved = append(resolved, exact)
+			} else {
+				allOK = false
+				break
+			}
+		}
+		if allOK {
+			prof.InitrdPaths = resolved
+		} else {
+			prof.InitrdPaths = nil
+		}
+	}
+
+	// Detect casper directory (handles both standard /casper and Pop!_OS /casper_pop-os_.../).
+	casperKernel := findInCasperDir("vmlinuz")
+	casperSquash := findInCasperDir("squashfs")
+	if casperSquash != "" {
+		prof.CasperDir = path.Dir(casperSquash)
+	} else if casperKernel != "" {
+		prof.CasperDir = path.Dir(casperKernel)
+	}
+
+	// Detect distro family from characteristic files, volume label, and parsed kernel args.
 	lblUpper := strings.ToUpper(volumeLabel + " " + fileName)
+	isPopOS := strings.Contains(lblUpper, "POP_OS") ||
+		strings.Contains(lblUpper, "POP-OS") ||
+		strings.Contains(lblUpper, "POP!_OS") ||
+		strings.Contains(strings.ToLower(prof.CasperDir), "pop-os") ||
+		strings.Contains(strings.ToLower(prof.KernelArgs), "hostname=pop-os")
+
 	switch {
-	case strings.Contains(lblUpper, "VOID") || findFirst([]string{"liveos/"}, "squashfs") != "" && strings.Contains(lblUpper, "VOID"):
+	case strings.Contains(lblUpper, "VOID") || (findFirst([]string{"liveos/"}, "squashfs") != "" && strings.Contains(lblUpper, "VOID")):
 		prof.Family = DistroVoid
-	case findFirst([]string{"casper/"}, "vmlinuz") != "" || findFirst([]string{"casper/"}, "squashfs") != "":
+	case isPopOS:
+		prof.Family = DistroPopOS
+	case casperKernel != "" || casperSquash != "":
 		prof.Family = DistroUbuntu
 	case findFirst([]string{"manjaro/"}, "") != "" || strings.Contains(lblUpper, "MANJARO"):
 		prof.Family = DistroManjaro
@@ -126,14 +276,12 @@ func DetectLinuxBoot(isoFS ImageFS, fileName, volumeLabel, fsUUID string) LinuxB
 		prof.Family = DistroOpenSUSE
 	}
 
-	// Fill in fallback kernel/initrd paths if not already parsed from grub.cfg / loader.conf.
+	// Fill in fallback kernel/initrd paths if not already resolved from ISO boot configs.
 	if prof.KernelPath == "" {
 		switch prof.Family {
-		case DistroUbuntu:
-			prof.KernelPath = firstNonEmpty(
-				findFirst([]string{"casper/"}, "vmlinuz"),
-			)
-			if initrd := findFirst([]string{"casper/"}, "initrd"); initrd != "" {
+		case DistroPopOS, DistroUbuntu:
+			prof.KernelPath = casperKernel
+			if initrd := findInCasperDir("initrd"); initrd != "" {
 				prof.InitrdPaths = []string{initrd}
 			}
 		case DistroFedora:
@@ -177,6 +325,14 @@ func DetectLinuxBoot(isoFS ImageFS, fileName, volumeLabel, fsUUID string) LinuxB
 				prof.InitrdPaths = []string{initrd}
 			}
 		}
+	} else if len(prof.InitrdPaths) == 0 && (prof.Family == DistroPopOS || prof.Family == DistroUbuntu) {
+		if initrd := findInCasperDir("initrd"); initrd != "" {
+			prof.InitrdPaths = []string{initrd}
+		}
+	}
+
+	if prof.CasperDir == "" && prof.KernelPath != "" && (prof.Family == DistroPopOS || prof.Family == DistroUbuntu) {
+		prof.CasperDir = path.Dir(prof.KernelPath)
 	}
 
 	return prof
@@ -188,6 +344,24 @@ func (p LinuxBootProfile) BuildKernelArgs(partUUID string) string {
 	args := strings.TrimSpace(p.KernelArgs)
 
 	switch p.Family {
+	case DistroPopOS:
+		if args == "" {
+			args = "boot=casper hostname=pop-os username=pop-os noprompt"
+			metaLower := strings.ToLower(p.CasperDir + " " + p.DisplayName + " " + p.VolumeLabel)
+			if strings.Contains(metaLower, "nvidia") {
+				args += " modules_load=nvidia nvidia-drm.modeset=1"
+			}
+		}
+		if !strings.Contains(args, "boot=casper") {
+			args = "boot=casper " + args
+		}
+		args = stripArgPrefix(args, "live-media=")
+		args = stripArgPrefix(args, "iso-scan/filename=")
+		if p.CasperDir != "" && p.CasperDir != "/" && p.CasperDir != "/casper" && !hasArgPrefix(args, "live-media-path=") {
+			args = insertBeforeDashDash(args, "live-media-path="+p.CasperDir)
+		}
+		return insertBeforeDashDash(args, "live-media=/dev/disk/by-partuuid/"+partUUID)
+
 	case DistroUbuntu:
 		if args == "" {
 			args = "boot=casper quiet splash"
@@ -197,6 +371,9 @@ func (p LinuxBootProfile) BuildKernelArgs(partUUID string) string {
 		}
 		args = stripArgPrefix(args, "live-media=")
 		args = stripArgPrefix(args, "iso-scan/filename=")
+		if p.CasperDir != "" && p.CasperDir != "/" && p.CasperDir != "/casper" && !hasArgPrefix(args, "live-media-path=") {
+			args = insertBeforeDashDash(args, "live-media-path="+p.CasperDir)
+		}
 		return insertBeforeDashDash(args, "live-media=/dev/disk/by-partuuid/"+partUUID)
 
 	case DistroFedora:
@@ -305,7 +482,7 @@ func parseFirstGrubEntry(cfg string) (kernel string, initrds []string, args stri
 		if (cmd == "linux" || cmd == "linuxefi") && kernel == "" {
 			k := fields[1]
 			if !strings.HasPrefix(k, "$") {
-				kernel = k
+				kernel = normalizeBootPath(k)
 				if len(fields) > 2 {
 					args = cleanGrubVars(strings.Join(fields[2:], " "))
 				}
@@ -313,7 +490,7 @@ func parseFirstGrubEntry(cfg string) (kernel string, initrds []string, args stri
 		} else if cmd == "initrd" || cmd == "initrdefi" {
 			for _, f := range fields[1:] {
 				if !strings.HasPrefix(f, "$") {
-					initrds = append(initrds, f)
+					initrds = append(initrds, normalizeBootPath(f))
 				}
 			}
 		}
@@ -322,6 +499,7 @@ func parseFirstGrubEntry(cfg string) (kernel string, initrds []string, args stri
 }
 
 func parseSystemdBootEntry(cfg string) (kernel string, initrds []string, args string) {
+	var optParts []string
 	for _, raw := range strings.Split(cfg, "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -331,16 +509,144 @@ func parseSystemdBootEntry(cfg string) (kernel string, initrds []string, args st
 		if len(fields) < 2 {
 			continue
 		}
-		switch fields[0] {
+		switch strings.ToLower(fields[0]) {
 		case "linux":
-			kernel = fields[1]
+			kernel = normalizeBootPath(fields[1])
 		case "initrd":
-			initrds = append(initrds, fields[1])
+			initrds = append(initrds, normalizeBootPath(fields[1]))
 		case "options":
-			args = strings.Join(fields[1:], " ")
+			optParts = append(optParts, strings.Join(fields[1:], " "))
 		}
 	}
-	return kernel, initrds, args
+	return kernel, initrds, strings.Join(optParts, " ")
+}
+
+func parseIsolinuxConfig(isoFS ImageFS, filesLower map[string]string, cfgPath string, visited map[string]bool, depth int) (kernel string, initrds []string, args string) {
+	if depth > 4 {
+		return "", nil, ""
+	}
+	lp := strings.ToLower(strings.TrimPrefix(cfgPath, "/"))
+	if visited[lp] {
+		return "", nil, ""
+	}
+	visited[lp] = true
+
+	exact, ok := filesLower[lp]
+	if !ok {
+		return "", nil, ""
+	}
+	cfg := readISOFileText(isoFS, strings.TrimPrefix(exact, "/"))
+	if cfg == "" {
+		return "", nil, ""
+	}
+
+	cfgDir := path.Dir(lp)
+	var includes []string
+	var argTokens []string
+
+	for _, raw := range strings.Split(cfg, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		cmd := strings.ToLower(fields[0])
+		switch cmd {
+		case "include":
+			inc := strings.TrimPrefix(strings.ReplaceAll(fields[1], `\`, "/"), "/")
+			if !strings.Contains(inc, "/") && cfgDir != "." && cfgDir != "" {
+				inc = path.Join(cfgDir, inc)
+			}
+			includes = append(includes, inc)
+		case "label":
+			if kernel != "" {
+				return kernel, initrds, strings.Join(argTokens, " ")
+			}
+		case "kernel", "linux":
+			cand := strings.TrimSpace(fields[1])
+			candLower := strings.ToLower(cand)
+			if strings.HasSuffix(candLower, ".c32") || strings.HasPrefix(candLower, "localboot") {
+				continue
+			}
+			if kernel == "" {
+				kernel = normalizeBootPath(cand)
+			}
+		case "initrd":
+			if kernel != "" {
+				for _, part := range strings.Split(fields[1], ",") {
+					if p := normalizeBootPath(part); p != "" {
+						initrds = append(initrds, p)
+					}
+				}
+			}
+		case "append":
+			if kernel == "" {
+				continue
+			}
+			for _, tok := range fields[1:] {
+				if strings.HasPrefix(strings.ToLower(tok), "initrd=") {
+					val := tok[len("initrd="):]
+					for _, part := range strings.Split(val, ",") {
+						if p := normalizeBootPath(part); p != "" {
+							initrds = append(initrds, p)
+						}
+					}
+					continue
+				}
+				if strings.Contains(tok, "$") {
+					continue
+				}
+				argTokens = append(argTokens, tok)
+			}
+		}
+	}
+
+	if kernel != "" {
+		return kernel, initrds, strings.Join(argTokens, " ")
+	}
+	for _, inc := range includes {
+		if k, inits, a := parseIsolinuxConfig(isoFS, filesLower, inc, visited, depth+1); k != "" {
+			return k, inits, a
+		}
+	}
+	return "", nil, ""
+}
+
+func loaderEntryPriority(name string) int {
+	nl := strings.ToLower(name)
+	switch {
+	case strings.Contains(nl, "memtest") || strings.Contains(nl, "uefi") || strings.Contains(nl, "firmware"):
+		return 3
+	case strings.Contains(nl, "recovery") || strings.Contains(nl, "fallback") || strings.Contains(nl, "safe") || strings.Contains(nl, "nomodeset"):
+		return 2
+	case strings.Contains(nl, "pop") || strings.Contains(nl, "live") || strings.Contains(nl, "current"):
+		return 0
+	default:
+		return 1
+	}
+}
+
+func isMetadataSidecar(base string) bool {
+	for _, suf := range []string{".sig", ".asc", ".gpg", ".sha256", ".sha512", ".md5", ".manifest", ".size", ".txt"} {
+		if strings.HasSuffix(base, suf) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeBootPath(p string) string {
+	p = strings.TrimSpace(strings.ReplaceAll(p, `\`, "/"))
+	if p == "" {
+		return ""
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	return p
 }
 
 func cleanGrubVars(args string) string {
@@ -352,6 +658,15 @@ func cleanGrubVars(args string) string {
 		kept = append(kept, tok)
 	}
 	return strings.Join(kept, " ")
+}
+
+func hasArgPrefix(args, prefix string) bool {
+	for _, tok := range strings.Fields(args) {
+		if strings.HasPrefix(tok, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func stripArgPrefix(args, prefix string) string {

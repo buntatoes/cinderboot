@@ -103,7 +103,9 @@ func ExtractISOEFIBundle(r io.ReaderAt, totalSize int64, isoFS ImageFS) EFIBundl
 								if loadRBA > 0 {
 									imgOff := int64(loadRBA) * isoSectorSize
 									imgLen := int64(secCnt) * 512
-									if imgLen == 0 || imgOff+imgLen > totalSize {
+									// El Torito secCnt <= 1 is used by xorriso/mkisofs when the EFI image
+									// size is deferred to the FAT BPB or exceeds the 16-bit sector count.
+									if secCnt <= 1 || imgOff+imgLen > totalSize {
 										imgLen = totalSize - imgOff
 										if imgLen > 64*1024*1024 {
 											imgLen = 64 * 1024 * 1024

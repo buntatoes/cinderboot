@@ -125,7 +125,7 @@ func WriteMultiboot(
 			return fmt.Errorf("%q is not a valid ISO9660 Linux image: %w", info.FileName, isoErr)
 		}
 		efiBundle := image.ExtractISOEFIBundle(f, info.SizeBytes, isoReader)
-		profile := image.DetectLinuxBoot(isoReader, info.FileName, isoReader.VolumeLabel(), isoReader.FSUUID())
+		profile := image.DetectLinuxBootWithEFI(isoReader, efiBundle.Files, info.FileName, isoReader.VolumeLabel(), isoReader.FSUUID())
 		_ = f.Close()
 
 		d := multibootDistro{
@@ -260,8 +260,10 @@ func WriteMultiboot(
 	for _, stubPath := range []string{
 		"EFI/BOOT/grub.cfg",
 		"EFI/ubuntu/grub.cfg",
+		"EFI/pop/grub.cfg",
 		"EFI/fedora/grub.cfg",
 		"EFI/debian/grub.cfg",
+		"EFI/opensuse/grub.cfg",
 	} {
 		if err := fw.WriteBytes(stubPath, []byte(stubCfg)); err != nil {
 			return fmt.Errorf("write %s: %w", stubPath, err)
@@ -461,7 +463,7 @@ func generateMultibootGrubCfg(distros []multibootDistro, espUUID string) string 
 			title = fmt.Sprintf("%s (%s)", title, strings.ToUpper(string(d.profile.Family)))
 		}
 		fmt.Fprintf(&b, "menuentry \"%s\" {\n", title)
-		writePartitionSearch(&b, d.profile.FSUUID, d.profile.VolumeLabel, partNum)
+		writePartitionSearch(&b, d.profile.FSUUID, d.profile.VolumeLabel, d.profile.KernelPath, partNum)
 
 		if d.profile.KernelPath != "" {
 			args := d.profile.BuildKernelArgs(d.partUUID)
@@ -506,11 +508,13 @@ func generateMultibootGrubCfg(distros []multibootDistro, espUUID string) string 
 	return b.String()
 }
 
-func writePartitionSearch(b *strings.Builder, fsUUID, label string, gptPartNum int) {
+func writePartitionSearch(b *strings.Builder, fsUUID, label, kernelPath string, gptPartNum int) {
 	if fsUUID != "" {
 		fmt.Fprintf(b, "    search --no-floppy --fs-uuid --set=root %s\n", fsUUID)
 	} else if label != "" {
 		fmt.Fprintf(b, "    search --no-floppy --label --set=root \"%s\"\n", sanitizeGrubTitle(label))
+	} else if kernelPath != "" {
+		fmt.Fprintf(b, "    search --no-floppy --file --set=root \"%s\"\n", sanitizeGrubTitle(kernelPath))
 	} else {
 		fmt.Fprintf(b, "    set root=(hd0,gpt%d)\n", gptPartNum)
 	}

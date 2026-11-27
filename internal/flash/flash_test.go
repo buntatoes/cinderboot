@@ -249,6 +249,260 @@ func TestWriteMultibootEndToEnd(t *testing.T) {
 	}
 }
 
+func TestWriteMultibootWithPopOSRockRidge(t *testing.T) {
+	dir := t.TempDir()
+
+	ubuntuISO := filepath.Join(dir, "ubuntu-24.04-desktop-amd64.iso")
+	popISO := filepath.Join(dir, "pop-os_22.04_amd64_nvidia_42.iso")
+	casperDir := "casper_pop-os_22.04_amd64_nvidia_debug_42"
+
+	buildSyntheticLinuxISO(t, ubuntuISO, "UBUNTU 24_04", "2024082716232600", map[string][]byte{
+		"casper/vmlinuz":     []byte("UBUNTU-KERNEL"),
+		"casper/initrd":      []byte("UBUNTU-INITRD"),
+		"boot/grub/grub.cfg": []byte("menuentry \"Try or Install Ubuntu\" {\n  linux /casper/vmlinuz quiet splash ---\n  initrd /casper/initrd\n}\n"),
+	}, true)
+
+	// Build a Pop!_OS-style ISO using Rock Ridge NM records (truncated uppercase ISO names + full POSIX Rock Ridge names),
+	// distinct modification timestamp (which GRUB2 uses as ISO9660 UUID), and an appended systemd-boot FAT ESP with loader/entries.
+	buildSyntheticRockRidgePopISO(t, popISO, "Pop_OS 22.04", "2024010100000000", "2024111509300000", map[string][]byte{
+		casperDir + "/vmlinuz.efi":         []byte("POP-KERNEL"),
+		casperDir + "/initrd.gz":           []byte("POP-INITRD"),
+		casperDir + "/filesystem.squashfs": []byte("POP-SQUASHFS"),
+	}, map[string][]byte{
+		"EFI/BOOT/BOOTX64.EFI": []byte("MZ-SYSTEMD-BOOT"),
+		"loader/entries/Pop_OS-current.conf": []byte(
+			"title Pop!_OS\n" +
+				"linux /EFI/Pop_OS/vmlinuz.efi\n" +
+				"initrd /EFI/Pop_OS/initrd.gz\n" +
+				"options boot=casper hostname=pop-os username=pop-os noprompt modules_load=nvidia nvidia-drm.modeset=1 ---\n",
+		),
+	})
+
+	const diskSize uint64 = 192 * 1024 * 1024
+	usbPath := filepath.Join(dir, "multiboot_pop_usb.img")
+	usbFile, err := os.Create(usbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer usbFile.Close()
+	if err := usbFile.Truncate(int64(diskSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := JobSpec{
+		ImagePaths: []string{ubuntuISO, popISO},
+		Mode:       ModeMultiboot,
+	}
+	if err := WriteMultiboot(context.Background(), spec, usbFile, diskSize, 512, nil); err != nil {
+		t.Fatalf("WriteMultiboot with Pop!_OS failed: %v", err)
+	}
+
+	parts, err := fs.ParseGPTPartitions(usbFile, int64(diskSize), 512)
+	if err != nil || len(parts) != 3 {
+		t.Fatalf("expected 3 GPT partitions, got %d (err=%v)", len(parts), err)
+	}
+
+	espOff := int64(parts[0].FirstLBA * 512)
+	espLen := int64((parts[0].LastLBA - parts[0].FirstLBA + 1) * 512)
+	fr, err := fs.OpenFATReader(io.NewSectionReader(usbFile, espOff, espLen), espLen)
+	if err != nil {
+		t.Fatalf("OpenFATReader failed: %v", err)
+	}
+	espFiles, err := fr.ReadAllFiles(16 * 1024 * 1024)
+	if err != nil {
+		t.Fatalf("ReadAllFiles failed: %v", err)
+	}
+	var menu string
+	for k, v := range espFiles {
+		if strings.EqualFold(k, "boot/grub/grub.cfg") {
+			menu = string(v)
+			break
+		}
+	}
+
+	popUUID := fs.FormatGUID(parts[2].UniqueGUID)
+	for _, want := range []string{
+		"(POP-OS)",
+		"2024-11-15-09-30-00-00",
+		"linux /" + casperDir + "/vmlinuz.efi",
+		"initrd /" + casperDir + "/initrd.gz",
+		"live-media-path=/" + casperDir,
+		"live-media=/dev/disk/by-partuuid/" + popUUID,
+		"modules_load=nvidia",
+	} {
+		if !strings.Contains(menu, want) {
+			t.Fatalf("generated grub.cfg missing Pop!_OS directive %q:\n%s", want, menu)
+		}
+	}
+}
+
+func buildSyntheticRockRidgePopISO(t *testing.T, outPath, label, createdTS, modifiedTS string, isoFiles, espFiles map[string][]byte) {
+	t.Helper()
+	const isoSec = 2048
+	isoBytes := uint64(40 * 1024 * 1024)
+	f, err := os.Create(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := f.Truncate(int64(isoBytes)); err != nil {
+		t.Fatal(err)
+	}
+
+	type dirNode struct {
+		dirs  map[string]*dirNode
+		files map[string][]byte
+		lba   uint32
+		size  uint32
+	}
+	root := &dirNode{dirs: map[string]*dirNode{}, files: map[string][]byte{}}
+	for rel, content := range isoFiles {
+		parts := strings.Split(rel, "/")
+		cur := root
+		for _, seg := range parts[:len(parts)-1] {
+			if cur.dirs[seg] == nil {
+				cur.dirs[seg] = &dirNode{dirs: map[string]*dirNode{}, files: map[string][]byte{}}
+			}
+			cur = cur.dirs[seg]
+		}
+		cur.files[parts[len(parts)-1]] = content
+	}
+
+	makeShortISO := func(name string, isDir bool) string {
+		up := strings.ToUpper(name)
+		if len(up) > 8 {
+			up = up[:8]
+		}
+		if !isDir {
+			return up + ";1"
+		}
+		return up
+	}
+
+	nextLBA := uint32(20)
+	var writeNode func(n *dirNode)
+	writeNode = func(n *dirNode) {
+		for _, sub := range n.dirs {
+			writeNode(sub)
+		}
+		var dirBuf bytes.Buffer
+		appendRRRec := func(fullName string, lba, size uint32, isDir bool) {
+			short := makeShortISO(fullName, isDir)
+			// Build Rock Ridge NM entry: 'N','M', len, version=1, flags=0, fullName...
+			nm := make([]byte, 5+len(fullName))
+			nm[0], nm[1] = 'N', 'M'
+			nm[2] = byte(len(nm))
+			nm[3] = 1
+			nm[4] = 0
+			copy(nm[5:], fullName)
+
+			baseLen := 33 + len(short)
+			if baseLen%2 != 0 {
+				baseLen++
+			}
+			recLen := baseLen + len(nm)
+			if recLen%2 != 0 {
+				recLen++
+			}
+			rec := make([]byte, recLen)
+			rec[0] = byte(recLen)
+			binary.LittleEndian.PutUint32(rec[2:6], lba)
+			binary.LittleEndian.PutUint32(rec[10:14], size)
+			if isDir {
+				rec[25] = 0x02
+			}
+			rec[32] = byte(len(short))
+			copy(rec[33:], short)
+			copy(rec[baseLen:], nm)
+			dirBuf.Write(rec)
+		}
+		for name, sub := range n.dirs {
+			appendRRRec(name, sub.lba, sub.size, true)
+		}
+		for name, data := range n.files {
+			flba := nextLBA
+			secs := uint32((len(data) + isoSec - 1) / isoSec)
+			if secs == 0 {
+				secs = 1
+			}
+			nextLBA += secs
+			if _, err := f.WriteAt(data, int64(flba)*isoSec); err != nil {
+				t.Fatal(err)
+			}
+			appendRRRec(name, flba, uint32(len(data)), false)
+		}
+		n.lba = nextLBA
+		raw := dirBuf.Bytes()
+		if len(raw) == 0 {
+			raw = make([]byte, isoSec)
+		}
+		secs := uint32((len(raw) + isoSec - 1) / isoSec)
+		n.size = secs * isoSec
+		nextLBA += secs
+		padded := make([]byte, n.size)
+		copy(padded, raw)
+		if _, err := f.WriteAt(padded, int64(n.lba)*isoSec); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeNode(root)
+
+	pvd := make([]byte, isoSec)
+	pvd[0] = 1
+	copy(pvd[1:6], "CD001")
+	pvd[6] = 1
+	copy(pvd[40:72], strings.Repeat(" ", 32))
+	copy(pvd[40:72], label)
+	binary.LittleEndian.PutUint32(pvd[158:162], root.lba)
+	binary.LittleEndian.PutUint32(pvd[166:170], root.size)
+	copy(pvd[813:829], createdTS)
+	copy(pvd[830:846], modifiedTS)
+	if _, err := f.WriteAt(pvd, 16*isoSec); err != nil {
+		t.Fatal(err)
+	}
+	term := make([]byte, isoSec)
+	term[0] = 255
+	copy(term[1:6], "CD001")
+	term[6] = 1
+	if _, err := f.WriteAt(term, 17*isoSec); err != nil {
+		t.Fatal(err)
+	}
+
+	espOff := uint64(2 * 1024 * 1024)
+	espSize := uint64(36 * 1024 * 1024)
+	gptParts := []fs.GPTPartition{
+		{
+			TypeGUID:   fs.GPTTypeBasicData,
+			UniqueGUID: fs.NewRandomGUID(),
+			FirstLBA:   64,
+			LastLBA:    (espOff / 512) - 1,
+			Name:       "ISO9660",
+		},
+		{
+			TypeGUID:   fs.GPTTypeEFI,
+			UniqueGUID: fs.NewRandomGUID(),
+			FirstLBA:   espOff / 512,
+			LastLBA:    (espOff+espSize)/512 - 1,
+			Name:       "PopESP",
+		},
+	}
+	if err := fs.WriteGPT(f, isoBytes, 512, gptParts); err != nil {
+		t.Fatal(err)
+	}
+	fw, err := fs.FormatFAT32(f, int64(espOff), espSize, 512, "POP_ESP")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rel, content := range espFiles {
+		if err := fw.WriteBytes(rel, content); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := fw.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // buildSyntheticLinuxISO creates a valid ISO9660 image with optional embedded GPT FAT32 ESP for testing.
 func buildSyntheticLinuxISO(t *testing.T, outPath, label, ts16 string, files map[string][]byte, withGPTEFI bool) {
 	t.Helper()

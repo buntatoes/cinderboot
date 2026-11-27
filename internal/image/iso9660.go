@@ -15,13 +15,14 @@ const isoSectorSize = 2048
 
 var ErrNotISO9660 = errors.New("not a valid ISO9660 image")
 
-// ISO9660Reader is our pure-Go read-only ISO9660 + Joliet parser.
+// ISO9660Reader is our pure-Go read-only ISO9660 + Rock Ridge + Joliet parser.
 type ISO9660Reader struct {
 	r                  io.ReaderAt
 	size               int64
 	volumeLabel        string
 	fsUUID             string // GRUB2-compatible ISO9660 timestamp UUID (YYYY-MM-DD-HH-MM-SS-CC)
 	joliet             bool
+	rockRidge          bool
 	hasElTorito        bool
 	elToritoCatalogLBA uint32
 	index              map[string]isoFileNode
@@ -89,19 +90,24 @@ func OpenISO9660(r io.ReaderAt, totalSize int64) (*ISO9660Reader, error) {
 		return nil, ErrNotISO9660
 	}
 
+	haveRockRidge := detectRockRidge(r, pvdRootLBA, pvdRootSize)
+
 	ir := &ISO9660Reader{
 		r:                  r,
 		size:               totalSize,
 		volumeLabel:        label,
 		fsUUID:             fsUUID,
-		joliet:             haveJoliet,
+		joliet:             haveJoliet && !haveRockRidge,
+		rockRidge:          haveRockRidge,
 		hasElTorito:        hasElTorito,
 		elToritoCatalogLBA: elToritoCatLBA,
 		index:              make(map[string]isoFileNode),
 	}
 
 	rootLBA, rootSize := pvdRootLBA, pvdRootSize
-	if haveJoliet && svdRootLBA != 0 && svdRootSize != 0 {
+	// Prefer Primary Volume Descriptor with Rock Ridge (matches GRUB2 & Linux kernel POSIX names);
+	// otherwise fall back to Joliet SVD when present.
+	if ir.joliet && svdRootLBA != 0 && svdRootSize != 0 {
 		rootLBA, rootSize = svdRootLBA, svdRootSize
 	}
 	if err := ir.walkDir(rootLBA, rootSize, "", 0); err != nil {
@@ -111,15 +117,18 @@ func OpenISO9660(r io.ReaderAt, totalSize int64) (*ISO9660Reader, error) {
 }
 
 func (i *ISO9660Reader) Format() string {
+	if i.rockRidge {
+		return "ISO9660 (Rock Ridge)"
+	}
 	if i.joliet {
 		return "ISO9660 (Joliet)"
 	}
 	return "ISO9660"
 }
 
-func (i *ISO9660Reader) VolumeLabel() string     { return i.volumeLabel }
-func (i *ISO9660Reader) FSUUID() string          { return i.fsUUID }
-func (i *ISO9660Reader) HasElTorito() bool       { return i.hasElTorito }
+func (i *ISO9660Reader) VolumeLabel() string        { return i.volumeLabel }
+func (i *ISO9660Reader) FSUUID() string             { return i.fsUUID }
+func (i *ISO9660Reader) HasElTorito() bool          { return i.hasElTorito }
 func (i *ISO9660Reader) ElToritoCatalogLBA() uint32 { return i.elToritoCatalogLBA }
 
 func parseISO9660UUID(creation, modification []byte) string {
@@ -142,10 +151,11 @@ func parseISO9660UUID(creation, modification []byte) string {
 		s := string(b[:16])
 		return fmt.Sprintf("%s-%s-%s-%s-%s-%s-%s", s[0:4], s[4:6], s[6:8], s[8:10], s[10:12], s[12:14], s[14:16])
 	}
-	if u := formatTS(creation); u != "" {
+	// Match GRUB2 (grub_iso9660_uuid) and blkid: prefer modification timestamp, fall back to creation.
+	if u := formatTS(modification); u != "" {
 		return u
 	}
-	return formatTS(modification)
+	return formatTS(creation)
 }
 
 func (i *ISO9660Reader) Walk(fn func(Entry) error) error {
@@ -242,15 +252,26 @@ func (i *ISO9660Reader) walkDir(lba, size uint32, prefix string, depth int) erro
 		}
 
 		var name string
-		if i.joliet {
-			name = decodeUTF16BEString(rawName)
-		} else {
-			name = string(rawName)
+		if i.rockRidge {
+			suStart := 33 + nameLen
+			if suStart%2 != 0 {
+				suStart++
+			}
+			if suStart < len(rec) {
+				name = i.parseRockRidgeName(rec[suStart:], 0)
+			}
 		}
-		if semi := strings.IndexByte(name, ';'); semi >= 0 {
-			name = name[:semi]
+		if name == "" {
+			if i.joliet {
+				name = decodeUTF16BEString(rawName)
+			} else {
+				name = string(rawName)
+			}
+			if semi := strings.IndexByte(name, ';'); semi >= 0 {
+				name = name[:semi]
+			}
+			name = strings.TrimSuffix(name, ".")
 		}
-		name = strings.TrimSuffix(name, ".")
 		if name == "" {
 			continue
 		}
@@ -314,4 +335,107 @@ func decodeUTF16BEString(b []byte) string {
 		u16[i] = binary.BigEndian.Uint16(b[i*2 : i*2+2])
 	}
 	return strings.TrimSpace(strings.TrimRight(string(utf16.Decode(u16)), "\x00"))
+}
+
+// detectRockRidge inspects the Primary Volume Descriptor root directory records
+// for SUSP / RRIP System Use entries (SP, RR, NM, PX, ER).
+func detectRockRidge(r io.ReaderAt, rootLBA, rootSize uint32) bool {
+	if rootLBA == 0 || rootSize == 0 {
+		return false
+	}
+	readLen := rootSize
+	if readLen > 8*isoSectorSize {
+		readLen = 8 * isoSectorSize
+	}
+	buf := make([]byte, readLen)
+	if _, err := r.ReadAt(buf, int64(rootLBA)*isoSectorSize); err != nil {
+		return false
+	}
+	pos := 0
+	for pos < len(buf) {
+		recLen := int(buf[pos])
+		if recLen == 0 {
+			nextSec := ((pos / isoSectorSize) + 1) * isoSectorSize
+			if nextSec <= pos || nextSec >= len(buf) {
+				break
+			}
+			pos = nextSec
+			continue
+		}
+		if pos+recLen > len(buf) || recLen < 34 {
+			break
+		}
+		rec := buf[pos : pos+recLen]
+		pos += recLen
+		nameLen := int(rec[32])
+		suStart := 33 + nameLen
+		if suStart%2 != 0 {
+			suStart++
+		}
+		for off := suStart; off+4 <= len(rec); {
+			eLen := int(rec[off+2])
+			if eLen < 4 || off+eLen > len(rec) {
+				break
+			}
+			sig0, sig1 := rec[off], rec[off+1]
+			if sig0 == 'S' && sig1 == 'P' && eLen >= 7 && rec[off+4] == 0xBE && rec[off+5] == 0xEF {
+				return true
+			}
+			if (sig0 == 'N' && sig1 == 'M') || (sig0 == 'R' && sig1 == 'R') || (sig0 == 'P' && sig1 == 'X') {
+				return true
+			}
+			if sig0 == 'S' && sig1 == 'T' {
+				break
+			}
+			off += eLen
+		}
+	}
+	return false
+}
+
+// parseRockRidgeName extracts the POSIX filename from Rock Ridge NM (and CE continuation) entries.
+func (i *ISO9660Reader) parseRockRidgeName(su []byte, depth int) string {
+	if depth > 4 || len(su) < 4 {
+		return ""
+	}
+	var b strings.Builder
+	var ceLBA, ceOff, ceLen uint32
+	done := false
+
+	for off := 0; off+4 <= len(su); {
+		eLen := int(su[off+2])
+		if eLen < 4 || off+eLen > len(su) {
+			break
+		}
+		sig0, sig1 := su[off], su[off+1]
+		if sig0 == 'S' && sig1 == 'T' {
+			break
+		}
+		if sig0 == 'N' && sig1 == 'M' && eLen >= 5 {
+			flags := su[off+4]
+			// Ignore CURRENT (0x02) and PARENT (0x04) directory references.
+			if (flags & (0x02 | 0x04)) == 0 {
+				b.Write(su[off+5 : off+eLen])
+				if (flags & 0x01) == 0 {
+					done = true
+				}
+			}
+		} else if sig0 == 'C' && sig1 == 'E' && eLen >= 28 {
+			ceLBA = binary.LittleEndian.Uint32(su[off+4 : off+8])
+			ceOff = binary.LittleEndian.Uint32(su[off+12 : off+16])
+			ceLen = binary.LittleEndian.Uint32(su[off+20 : off+24])
+		}
+		off += eLen
+	}
+
+	if !done && ceLen > 0 && ceLen <= 64*1024 {
+		absOff := int64(ceLBA)*isoSectorSize + int64(ceOff)
+		if absOff >= 0 && absOff+int64(ceLen) <= i.size {
+			cont := make([]byte, ceLen)
+			if _, err := i.r.ReadAt(cont, absOff); err == nil {
+				b.WriteString(i.parseRockRidgeName(cont, depth+1))
+			}
+		}
+	}
+	return b.String()
 }

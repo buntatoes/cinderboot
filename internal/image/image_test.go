@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -214,5 +215,131 @@ func TestSyntheticUDFWindowsISOInspect(t *testing.T) {
 	}
 	if raSize != uint64(len(instData)) || string(part) != "INSTALL" {
 		t.Fatalf("OpenReaderAt mismatch: got %q", string(part))
+	}
+}
+
+type memISOFS struct {
+	files map[string][]byte
+}
+
+func (m memISOFS) Format() string      { return "ISO9660 (Rock Ridge)" }
+func (m memISOFS) VolumeLabel() string { return "Pop_OS 22.04 amd64 Nvidia" }
+func (m memISOFS) Walk(fn func(Entry) error) error {
+	for p, b := range m.files {
+		if err := fn(Entry{Path: p, Size: uint64(len(b))}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func (m memISOFS) Open(relPath string) (io.ReadCloser, uint64, error) {
+	for k, v := range m.files {
+		if strings.EqualFold(k, strings.TrimPrefix(relPath, "/")) {
+			return io.NopCloser(bytes.NewReader(v)), uint64(len(v)), nil
+		}
+	}
+	return nil, 0, os.ErrNotExist
+}
+func (m memISOFS) OpenReaderAt(relPath string) (io.ReaderAt, uint64, error) {
+	for k, v := range m.files {
+		if strings.EqualFold(k, strings.TrimPrefix(relPath, "/")) {
+			return bytes.NewReader(v), uint64(len(v)), nil
+		}
+	}
+	return nil, 0, os.ErrNotExist
+}
+
+func TestISO9660UUIDPrefersModificationTimestamp(t *testing.T) {
+	got := parseISO9660UUID([]byte("2024010100000000"), []byte("2024091518304500"))
+	if got != "2024-09-15-18-30-45-00" {
+		t.Fatalf("expected modification UUID, got %q", got)
+	}
+	fallback := parseISO9660UUID([]byte("2024010100000000"), []byte("0000000000000000"))
+	if fallback != "2024-01-01-00-00-00-00" {
+		t.Fatalf("expected creation fallback UUID, got %q", fallback)
+	}
+}
+
+func TestDetectPopOSFromEFILoaderAndCustomCasperDir(t *testing.T) {
+	casperDir := "casper_pop-os_22.04_amd64_nvidia_debug_42"
+	iso := memISOFS{
+		files: map[string][]byte{
+			casperDir + "/vmlinuz.efi":         []byte("POP-KERNEL"),
+			casperDir + "/initrd.gz":           []byte("POP-INITRD"),
+			casperDir + "/filesystem.squashfs": []byte("POP-SQUASHFS"),
+		},
+	}
+	// Simulate Pop!_OS loader/entries inside the appended FAT ESP using ESP-relative kernel path.
+	efiFiles := map[string][]byte{
+		"loader/entries/Pop_OS-recovery.conf": []byte("title Recovery\nlinux /vmlinuz.efi\noptions boot=casper recovery\n"),
+		"loader/entries/Pop_OS-current.conf": []byte(
+			"title Pop!_OS\n" +
+				"linux /EFI/Pop_OS/vmlinuz.efi\n" +
+				"initrd /EFI/Pop_OS/initrd.gz\n" +
+				"options boot=casper hostname=pop-os username=pop-os noprompt\n" +
+				"options modules_load=nvidia nvidia-drm.modeset=1 ---\n",
+		),
+	}
+
+	prof := DetectLinuxBootWithEFI(iso, efiFiles, "pop-os_22.04_amd64_nvidia_42.iso", "Pop_OS 22.04 amd64 Nvidia", "2024-09-15-18-30-45-00")
+	if prof.Family != DistroPopOS {
+		t.Fatalf("expected DistroPopOS, got %q", prof.Family)
+	}
+	if prof.KernelPath != "/"+casperDir+"/vmlinuz.efi" {
+		t.Fatalf("expected resolved ISO kernel path, got %q", prof.KernelPath)
+	}
+	if len(prof.InitrdPaths) != 1 || prof.InitrdPaths[0] != "/"+casperDir+"/initrd.gz" {
+		t.Fatalf("expected resolved ISO initrd path, got %v", prof.InitrdPaths)
+	}
+	args := prof.BuildKernelArgs("11111111-2222-3333-4444-555555555555")
+	for _, want := range []string{
+		"boot=casper",
+		"hostname=pop-os",
+		"modules_load=nvidia",
+		"live-media-path=/" + casperDir,
+		"live-media=/dev/disk/by-partuuid/11111111-2222-3333-4444-555555555555",
+	} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("Pop!_OS kernel args missing %q: %s", want, args)
+		}
+	}
+	if strings.Index(args, "live-media=/dev/disk/by-partuuid/") > strings.Index(args, "---") {
+		t.Fatalf("expected live-media= inserted before ---: %s", args)
+	}
+}
+
+func TestDetectPopOSFromIsolinuxInclude(t *testing.T) {
+	casperDir := "casper_pop-os_24.04_amd64_intel_debug_12"
+	iso := memISOFS{
+		files: map[string][]byte{
+			casperDir + "/vmlinuz.efi":         []byte("POP-KERNEL"),
+			casperDir + "/initrd.gz":           []byte("POP-INITRD"),
+			casperDir + "/filesystem.squashfs": []byte("POP-SQUASHFS"),
+			"isolinux/isolinux.cfg":            []byte("default vesamenu.c32\ninclude live.cfg\n"),
+			"isolinux/live.cfg": []byte(
+				"label live\n" +
+					"  menu label Try or Install Pop!_OS\n" +
+					"  kernel /" + casperDir + "/vmlinuz.efi\n" +
+					"  append initrd=/" + casperDir + "/initrd.gz boot=casper live-media-path=/" + casperDir + " hostname=pop-os username=pop-os noprompt ---\n",
+			),
+		},
+	}
+
+	prof := DetectLinuxBootWithEFI(iso, nil, "pop-os_24.04_amd64_intel_12.iso", "POP_OS", "2025-10-01-12-00-00-00")
+	if prof.Family != DistroPopOS {
+		t.Fatalf("expected DistroPopOS, got %q", prof.Family)
+	}
+	if prof.KernelPath != "/"+casperDir+"/vmlinuz.efi" {
+		t.Fatalf("unexpected kernel path: %q", prof.KernelPath)
+	}
+	if len(prof.InitrdPaths) != 1 || prof.InitrdPaths[0] != "/"+casperDir+"/initrd.gz" {
+		t.Fatalf("unexpected initrd paths: %v", prof.InitrdPaths)
+	}
+	args := prof.BuildKernelArgs("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+	if strings.Count(args, "live-media-path=") != 1 {
+		t.Fatalf("expected single live-media-path=, got: %s", args)
+	}
+	if !strings.Contains(args, "live-media=/dev/disk/by-partuuid/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee") {
+		t.Fatalf("missing PARTUUID live-media pin: %s", args)
 	}
 }
