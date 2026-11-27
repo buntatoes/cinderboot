@@ -2,6 +2,7 @@
 package fs
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -198,9 +199,22 @@ func (f *FAT32Writer) MkdirAll(relPath string) error {
 	return nil
 }
 
+// VolumeSerialString returns the FAT32 volume serial formatted for GRUB2 --fs-uuid (XXXX-XXXX).
+func (f *FAT32Writer) VolumeSerialString() string {
+	return fmt.Sprintf("%04X-%04X", f.volumeSerial>>16, f.volumeSerial&0xFFFF)
+}
+
 // WriteFile streams a file of known size into the FAT32 filesystem at relPath.
 // Parent directories are created automatically.
 func (f *FAT32Writer) WriteFile(relPath string, r io.Reader, size uint64, onChunk func(int)) error {
+	return f.WriteFileCtx(context.Background(), relPath, r, size, onChunk)
+}
+
+// WriteFileCtx streams a file of known size into the FAT32 filesystem with cancellation checks.
+func (f *FAT32Writer) WriteFileCtx(ctx context.Context, relPath string, r io.Reader, size uint64, onChunk func(int)) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if size > 0xFFFFFFFF {
 		return fmt.Errorf("file %q exceeds FAT32 4 GiB limit (%d bytes)", relPath, size)
 	}
@@ -241,6 +255,9 @@ func (f *FAT32Writer) WriteFile(relPath string, r io.Reader, size uint64, onChun
 		remaining := size
 		idx := 0
 		for idx < len(chain) {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			// Measure contiguous run starting at chain[idx]
 			runLen := 1
 			for idx+runLen < len(chain) &&

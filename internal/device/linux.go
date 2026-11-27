@@ -15,7 +15,10 @@ import (
 	"time"
 )
 
-const linuxBLKRRPART = 0x125f
+const (
+	linuxBLKRRPART = 0x125f
+	linuxBLKFLSBUF = 0x1261
+)
 
 // ListRemovable returns removable USB block devices detected via Linux sysfs.
 // Internal OS, NVMe, SATA, loop, dm, and root-mounted disks are excluded.
@@ -178,7 +181,17 @@ func OpenRawRead(d Drive) (*os.File, error) {
 	return os.NewFile(uintptr(fd), d.DevicePath), nil
 }
 
-// RereadPartitionTable tells the Linux kernel to rescan partitions on devPath.
+// FlushReadCache drops Linux block device page caches (BLKFLSBUF) so subsequent
+// verification reads directly from physical USB flash storage rather than RAM.
+func FlushReadCache(f *os.File) error {
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), linuxBLKFLSBUF, 0)
+	if errno != 0 {
+		return fmt.Errorf("BLKFLSBUF on %s: %w", f.Name(), errno)
+	}
+	return nil
+}
+
+// RereadPartitionTable tells the Linux kernel to rescan partitions on an open block device.
 func RereadPartitionTable(f *os.File) error {
 	_ = f.Sync()
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), linuxBLKRRPART, 0)
@@ -186,6 +199,28 @@ func RereadPartitionTable(f *os.File) error {
 		return fmt.Errorf("BLKRRPART on %s: %w", f.Name(), errno)
 	}
 	return nil
+}
+
+// RereadPartitionTablePath opens devPath non-exclusively after writing completes
+// and asks the Linux kernel to rescan the partition table (retrying briefly on EBUSY).
+func RereadPartitionTablePath(devPath string) error {
+	fd, err := syscall.Open(devPath, syscall.O_RDONLY|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("open %s for partition reread: %w", devPath, err)
+	}
+	f := os.NewFile(uintptr(fd), devPath)
+	defer f.Close()
+
+	var lastErr error
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := RereadPartitionTable(f); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+	}
+	return lastErr
 }
 
 func shouldSkipBlockName(name string) bool {

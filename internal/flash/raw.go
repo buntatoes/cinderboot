@@ -12,11 +12,13 @@ import (
 	"time"
 
 	"github.com/buntatoes/cinderboot/internal/device"
+	"github.com/buntatoes/cinderboot/internal/fs"
 	"github.com/buntatoes/cinderboot/internal/image"
 )
 
 const (
-	rawChunkSize    = 4 * 1024 * 1024 // 4 MiB aligned sequential I/O
+	rawChunkSize    = 2 * 1024 * 1024  // 2 MiB aligned sequential I/O (fast + responsive cancel)
+	rawSyncInterval = 16 * 1024 * 1024 // Flush dirty buffers every 16 MiB to prevent USB writeback stalls
 	maxRetryAttempt = 3
 )
 
@@ -117,6 +119,16 @@ func flashRawToDrive(ctx context.Context, spec JobSpec, info image.Info, drv dev
 	if err != nil {
 		return err
 	}
+
+	emit(ProgressEvent{
+		Phase:   "prepare",
+		Message: "Clearing old partition tables and backup GPT metadata...",
+	})
+	if err := fs.WipePartitionTables(f, drv.SizeBytes, drv.SectorSize); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("clear old partition tables: %w", err)
+	}
+
 	hashHex, written, err := WriteRawStream(ctx, spec.ImagePath, f, drv.SizeBytes, drv.SectorSize, emit)
 	if err != nil {
 		_ = f.Close()
@@ -133,7 +145,6 @@ func flashRawToDrive(ctx context.Context, spec JobSpec, info image.Info, drv dev
 		_ = f.Close()
 		return fmt.Errorf("sync target device: %w", err)
 	}
-	_ = device.RereadPartitionTable(f)
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close target device: %w", err)
 	}
@@ -143,11 +154,44 @@ func flashRawToDrive(ctx context.Context, spec JobSpec, info image.Info, drv dev
 		if err != nil {
 			return fmt.Errorf("reopen target device for verification: %w", err)
 		}
-		defer rf.Close()
-		if err := VerifyRawReadBack(ctx, rf, written, hashHex, emit); err != nil {
-			return err
+		_ = device.FlushReadCache(rf)
+		vErr := VerifyRawReadBack(ctx, rf, written, hashHex, emit)
+		_ = rf.Close()
+		if vErr != nil {
+			return vErr
 		}
 	}
+
+	// Relocate Backup GPT & Protective MBR to the physical end of the USB drive when a hybrid
+	// GPT ISO (such as Ubuntu 22.04/24.04+) is smaller than the target disk so strict UEFI
+	// firmwares validate the GPT table and detect the EFI System Partition.
+	gf, err := device.OpenRawWrite(drv)
+	if err != nil {
+		return fmt.Errorf("reopen target device for GPT check: %w", err)
+	}
+	relocated, gErr := fs.RelocateBackupGPT(gf, drv.SizeBytes, drv.SectorSize)
+	if gErr != nil {
+		_ = gf.Close()
+		return fmt.Errorf("relocate backup GPT: %w", gErr)
+	}
+	if relocated {
+		emit(ProgressEvent{
+			Phase:      "partition",
+			BytesDone:  written,
+			BytesTotal: written,
+			Percent:    100,
+			Message:    "Relocated Backup GPT to end of USB drive for UEFI compatibility",
+		})
+		if err := gf.Sync(); err != nil {
+			_ = gf.Close()
+			return fmt.Errorf("sync relocated GPT: %w", err)
+		}
+	}
+	if err := gf.Close(); err != nil {
+		return fmt.Errorf("close target device after GPT check: %w", err)
+	}
+
+	_ = device.RereadPartitionTablePath(drv.DevicePath)
 
 	emit(ProgressEvent{
 		Phase:      "complete",
@@ -191,6 +235,11 @@ func WriteRawStream(
 	hasher := sha256.New()
 	tracker := newSpeedTracker(totalExpected)
 	buf := make([]byte, rawChunkSize)
+	type syncer interface {
+		Sync() error
+	}
+	dstSync, canSync := dst.(syncer)
+	var sinceSync uint64
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -219,6 +268,13 @@ func WriteRawStream(
 				return "", writtenBytes, fmt.Errorf("write to target device at offset %d: %w", writtenBytes, wErr)
 			}
 			writtenBytes += uint64(n)
+			sinceSync += uint64(len(writeSlice))
+			if canSync && sinceSync >= rawSyncInterval {
+				if sErr := dstSync.Sync(); sErr != nil {
+					return "", writtenBytes, fmt.Errorf("flush target device at offset %d: %w", writtenBytes, sErr)
+				}
+				sinceSync = 0
+			}
 
 			if tracker.shouldEmit(false) && emit != nil {
 				spd := tracker.speed(writtenBytes)
@@ -322,6 +378,7 @@ func VerifyImageAgainstDevice(ctx context.Context, imgPath, devPath string, incl
 		return "", err
 	}
 	defer rf.Close()
+	_ = device.FlushReadCache(rf)
 
 	if err := VerifyRawReadBack(ctx, rf, uint64(n), expected, emit); err != nil {
 		return "", err

@@ -274,11 +274,39 @@ func OpenRawRead(d Drive) (*os.File, error) {
 	return os.NewFile(uintptr(h), d.DevicePath), nil
 }
 
+// FlushReadCache is a no-op on Windows (OpenRawWrite uses write-through).
+func FlushReadCache(f *os.File) error {
+	return nil
+}
+
 // RereadPartitionTable asks Windows to re-enumerate partitions on the target physical disk.
 func RereadPartitionTable(f *os.File) error {
 	_ = f.Sync()
 	var bytesRet uint32
 	return syscall.DeviceIoControl(syscall.Handle(f.Fd()), ioctlDiskUpdateProperties, nil, 0, nil, 0, &bytesRet, nil)
+}
+
+// RereadPartitionTablePath opens the target physical disk and asks Windows to re-enumerate partitions.
+func RereadPartitionTablePath(devPath string) error {
+	p, err := syscall.UTF16PtrFromString(devPath)
+	if err != nil {
+		return err
+	}
+	h, err := syscall.CreateFile(
+		p,
+		syscall.GENERIC_READ|syscall.GENERIC_WRITE,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE,
+		nil,
+		syscall.OPEN_EXISTING,
+		0,
+		0,
+	)
+	if err != nil {
+		return err
+	}
+	defer syscall.CloseHandle(h)
+	var bytesRet uint32
+	return syscall.DeviceIoControl(h, ioctlDiskUpdateProperties, nil, 0, nil, 0, &bytesRet, nil)
 }
 
 func openDiskQueryHandle(devPath string) (syscall.Handle, error) {

@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
+	"time"
 
 	"github.com/buntatoes/cinderboot/internal/flash"
 )
@@ -21,6 +23,8 @@ func IsElevated() bool {
 
 // RunFlash executes the flash job directly if already root, or launches this same binary
 // in privileged `worker` mode via pkexec (graphical Polkit prompt) or sudo.
+// Cancellation is propagated via a user-owned cancel sentinel file + stdin EOF so an
+// unprivileged UI process can cleanly stop a root-elevated worker without EPERM.
 func RunFlash(ctx context.Context, spec flash.JobSpec, sink flash.ProgressSink) error {
 	if IsElevated() {
 		return flash.Execute(ctx, spec, sink)
@@ -30,21 +34,25 @@ func RunFlash(ctx context.Context, spec flash.JobSpec, sink flash.ProgressSink) 
 	if err != nil {
 		return fmt.Errorf("resolve executable path: %w", err)
 	}
-	specPath, err := writeTempSpec(spec)
+	tmp, err := prepareJobTempFiles(spec)
 	if err != nil {
 		return fmt.Errorf("write job spec: %w", err)
 	}
-	defer os.Remove(specPath)
+	defer tmp.cleanup()
 
 	var cmd *exec.Cmd
 	if pkexec, err := exec.LookPath("pkexec"); err == nil {
-		cmd = exec.CommandContext(ctx, pkexec, selfExe, "worker", "--spec", specPath)
+		cmd = exec.Command(pkexec, selfExe, "worker", "--spec", tmp.specPath, "--cancel", tmp.cancelPath)
 	} else if sudo, err := exec.LookPath("sudo"); err == nil {
-		cmd = exec.CommandContext(ctx, sudo, selfExe, "worker", "--spec", specPath)
+		cmd = exec.Command(sudo, selfExe, "worker", "--spec", tmp.specPath, "--cancel", tmp.cancelPath)
 	} else {
 		return fmt.Errorf("neither pkexec nor sudo was found; run cinderboot with root privileges")
 	}
 
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err
@@ -57,6 +65,29 @@ func RunFlash(ctx context.Context, spec flash.JobSpec, sink flash.ProgressSink) 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start elevated worker: %w", err)
 	}
+
+	doneCh := make(chan struct{})
+	defer close(doneCh)
+
+	// Propagate cancellation safely to the root worker via sentinel file + stdin EOF.
+	go func() {
+		select {
+		case <-ctx.Done():
+			tmp.triggerCancel()
+			_ = stdinPipe.Close()
+			// Give the root worker a moment to stop cleanly before attempting fallback signal.
+			select {
+			case <-doneCh:
+				return
+			case <-time.After(4 * time.Second):
+				if cmd.Process != nil {
+					_ = cmd.Process.Signal(syscall.SIGTERM)
+				}
+			}
+		case <-doneCh:
+			_ = stdinPipe.Close()
+		}
+	}()
 
 	var workerErrMsg string
 	sc := bufio.NewScanner(stdout)
@@ -84,6 +115,9 @@ func RunFlash(ctx context.Context, spec flash.JobSpec, sink flash.ProgressSink) 
 	}
 
 	waitErr := cmd.Wait()
+	if ctx.Err() != nil {
+		return context.Canceled
+	}
 	if workerErrMsg != "" {
 		return fmt.Errorf("%s", workerErrMsg)
 	}

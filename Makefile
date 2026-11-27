@@ -1,4 +1,4 @@
-VERSION := 0.0.3
+VERSION := 0.0.4
 LDFLAGS_COMMON := -s -w -X github.com/buntatoes/cinderboot/internal/version.Version=$(VERSION)
 
 .PHONY: test vet build-linux build-windows package clean

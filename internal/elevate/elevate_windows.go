@@ -67,23 +67,22 @@ func RunFlash(ctx context.Context, spec flash.JobSpec, sink flash.ProgressSink) 
 	if err != nil {
 		return fmt.Errorf("resolve executable path: %w", err)
 	}
-	specPath, err := writeTempSpec(spec)
+	tmp, err := prepareJobTempFiles(spec)
 	if err != nil {
 		return err
 	}
-	defer os.Remove(specPath)
+	defer tmp.cleanup()
 
-	eventsFile, err := os.CreateTemp("", "cinderboot-events-*.jsonl")
-	if err != nil {
+	eventsPath := filepath.Join(tmp.dir, "events.jsonl")
+	if ef, err := os.OpenFile(eventsPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600); err == nil {
+		_ = ef.Close()
+	} else {
 		return err
 	}
-	eventsPath := eventsFile.Name()
-	_ = eventsFile.Close()
-	defer os.Remove(eventsPath)
 
 	verbPtr, _ := syscall.UTF16PtrFromString("runas")
 	filePtr, _ := syscall.UTF16PtrFromString(selfExe)
-	params := fmt.Sprintf(`worker --spec "%s" --events "%s"`, specPath, eventsPath)
+	params := fmt.Sprintf(`worker --spec "%s" --events "%s" --cancel "%s"`, tmp.specPath, eventsPath, tmp.cancelPath)
 	paramsPtr, _ := syscall.UTF16PtrFromString(params)
 	dirPtr, _ := syscall.UTF16PtrFromString(filepath.Dir(selfExe))
 
@@ -141,8 +140,14 @@ func RunFlash(ctx context.Context, spec flash.JobSpec, sink flash.ProgressSink) 
 	for {
 		select {
 		case <-ctx.Done():
-			_, _, _ = procTerminateProcess.Call(uintptr(sei.hProcess), 1)
-			return ctx.Err()
+			// Signal graceful cancellation first so the elevated worker closes USB handles cleanly.
+			tmp.triggerCancel()
+			res, _ := syscall.WaitForSingleObject(sei.hProcess, 3000)
+			if res != syscall.WAIT_OBJECT_0 {
+				_, _, _ = procTerminateProcess.Call(uintptr(sei.hProcess), 1)
+			}
+			readNewEvents()
+			return context.Canceled
 		case <-ticker.C:
 			readNewEvents()
 			res, _ := syscall.WaitForSingleObject(sei.hProcess, 0)

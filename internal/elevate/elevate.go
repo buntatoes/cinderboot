@@ -4,25 +4,52 @@ package elevate
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 
 	"github.com/buntatoes/cinderboot/internal/flash"
 )
 
-func writeTempSpec(spec flash.JobSpec) (string, error) {
-	f, err := os.CreateTemp("", "cinderboot-job-*.json")
-	if err != nil {
-		return "", err
+type jobTempFiles struct {
+	dir        string
+	specPath   string
+	cancelPath string
+}
+
+func (j jobTempFiles) cleanup() {
+	if j.dir != "" {
+		_ = os.RemoveAll(j.dir)
 	}
-	path := f.Name()
-	enc := json.NewEncoder(f)
-	if err := enc.Encode(spec); err != nil {
+}
+
+func (j jobTempFiles) triggerCancel() {
+	if j.cancelPath != "" {
+		_ = os.WriteFile(j.cancelPath, []byte("cancel\n"), 0o600)
+	}
+}
+
+func prepareJobTempFiles(spec flash.JobSpec) (jobTempFiles, error) {
+	dir, err := os.MkdirTemp("", "cinderboot-job-*")
+	if err != nil {
+		return jobTempFiles{}, err
+	}
+	specPath := filepath.Join(dir, "spec.json")
+	f, err := os.OpenFile(specPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return jobTempFiles{}, err
+	}
+	if err := json.NewEncoder(f).Encode(spec); err != nil {
 		_ = f.Close()
-		_ = os.Remove(path)
-		return "", err
+		_ = os.RemoveAll(dir)
+		return jobTempFiles{}, err
 	}
 	if err := f.Close(); err != nil {
-		_ = os.Remove(path)
-		return "", err
+		_ = os.RemoveAll(dir)
+		return jobTempFiles{}, err
 	}
-	return path, nil
+	return jobTempFiles{
+		dir:        dir,
+		specPath:   specPath,
+		cancelPath: filepath.Join(dir, "cancel"),
+	}, nil
 }

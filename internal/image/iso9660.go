@@ -17,13 +17,15 @@ var ErrNotISO9660 = errors.New("not a valid ISO9660 image")
 
 // ISO9660Reader is our pure-Go read-only ISO9660 + Joliet parser.
 type ISO9660Reader struct {
-	r           io.ReaderAt
-	size        int64
-	volumeLabel string
-	joliet      bool
-	hasElTorito bool
-	index       map[string]isoFileNode
-	ordered     []Entry
+	r                  io.ReaderAt
+	size               int64
+	volumeLabel        string
+	fsUUID             string // GRUB2-compatible ISO9660 timestamp UUID (YYYY-MM-DD-HH-MM-SS-CC)
+	joliet             bool
+	hasElTorito        bool
+	elToritoCatalogLBA uint32
+	index              map[string]isoFileNode
+	ordered            []Entry
 }
 
 type isoFileNode struct {
@@ -39,7 +41,8 @@ func OpenISO9660(r io.ReaderAt, totalSize int64) (*ISO9660Reader, error) {
 
 	var pvdRootLBA, pvdRootSize uint32
 	var svdRootLBA, svdRootSize uint32
-	var label string
+	var elToritoCatLBA uint32
+	var label, fsUUID string
 	var havePVD, haveJoliet, hasElTorito bool
 
 	sec := make([]byte, isoSectorSize)
@@ -61,11 +64,13 @@ func OpenISO9660(r io.ReaderAt, totalSize int64) (*ISO9660Reader, error) {
 		case 0: // Boot Record
 			if strings.HasPrefix(string(sec[7:39]), "EL TORITO SPECIFICATION") {
 				hasElTorito = true
+				elToritoCatLBA = binary.LittleEndian.Uint32(sec[71:75])
 			}
 		case 1: // Primary Volume Descriptor
 			label = strings.TrimSpace(string(sec[40:72]))
 			pvdRootLBA = binary.LittleEndian.Uint32(sec[158:162])
 			pvdRootSize = binary.LittleEndian.Uint32(sec[166:170])
+			fsUUID = parseISO9660UUID(sec[813:829], sec[830:846])
 			havePVD = true
 		case 2: // Supplementary Volume Descriptor (check Joliet escape sequences)
 			esc := sec[88:91]
@@ -85,12 +90,14 @@ func OpenISO9660(r io.ReaderAt, totalSize int64) (*ISO9660Reader, error) {
 	}
 
 	ir := &ISO9660Reader{
-		r:           r,
-		size:        totalSize,
-		volumeLabel: label,
-		joliet:      haveJoliet,
-		hasElTorito: hasElTorito,
-		index:       make(map[string]isoFileNode),
+		r:                  r,
+		size:               totalSize,
+		volumeLabel:        label,
+		fsUUID:             fsUUID,
+		joliet:             haveJoliet,
+		hasElTorito:        hasElTorito,
+		elToritoCatalogLBA: elToritoCatLBA,
+		index:              make(map[string]isoFileNode),
 	}
 
 	rootLBA, rootSize := pvdRootLBA, pvdRootSize
@@ -110,8 +117,36 @@ func (i *ISO9660Reader) Format() string {
 	return "ISO9660"
 }
 
-func (i *ISO9660Reader) VolumeLabel() string { return i.volumeLabel }
-func (i *ISO9660Reader) HasElTorito() bool   { return i.hasElTorito }
+func (i *ISO9660Reader) VolumeLabel() string     { return i.volumeLabel }
+func (i *ISO9660Reader) FSUUID() string          { return i.fsUUID }
+func (i *ISO9660Reader) HasElTorito() bool       { return i.hasElTorito }
+func (i *ISO9660Reader) ElToritoCatalogLBA() uint32 { return i.elToritoCatalogLBA }
+
+func parseISO9660UUID(creation, modification []byte) string {
+	formatTS := func(b []byte) string {
+		if len(b) < 16 {
+			return ""
+		}
+		allZero := true
+		for _, c := range b[:16] {
+			if c < '0' || c > '9' {
+				return ""
+			}
+			if c != '0' {
+				allZero = false
+			}
+		}
+		if allZero {
+			return ""
+		}
+		s := string(b[:16])
+		return fmt.Sprintf("%s-%s-%s-%s-%s-%s-%s", s[0:4], s[4:6], s[6:8], s[8:10], s[10:12], s[12:14], s[14:16])
+	}
+	if u := formatTS(creation); u != "" {
+		return u
+	}
+	return formatTS(modification)
+}
 
 func (i *ISO9660Reader) Walk(fn func(Entry) error) error {
 	for _, e := range i.ordered {

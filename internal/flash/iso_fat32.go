@@ -36,10 +36,10 @@ func flashISOFAT32ToDrive(ctx context.Context, spec JobSpec, info image.Info, dr
 		_ = f.Close()
 		return fmt.Errorf("sync target device: %w", err)
 	}
-	_ = device.RereadPartitionTable(f)
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close target device: %w", err)
 	}
+	_ = device.RereadPartitionTablePath(drv.DevicePath)
 	emit(ProgressEvent{
 		Phase:   "complete",
 		Percent: 100,
@@ -169,7 +169,7 @@ func WriteISOFAT32(
 					errCh <- pw.CloseWithError(stream(pw))
 				}()
 
-				wErr := fw.WriteFile(destRel, pr, exactSize, func(n int) {
+				wErr := fw.WriteFileCtx(ctx, destRel, pr, exactSize, func(n int) {
 					reportBytes(n, fmt.Sprintf("%s (%d/%d)", destRel, partNum, totalParts))
 				})
 				_ = pr.Close()
@@ -194,7 +194,7 @@ func WriteISOFAT32(
 		if err != nil {
 			return fmt.Errorf("open ISO entry %q: %w", e.Path, err)
 		}
-		err = fw.WriteFile(e.Path, rc, sz, func(n int) {
+		err = fw.WriteFileCtx(ctx, e.Path, rc, sz, func(n int) {
 			reportBytes(n, e.Path)
 		})
 		_ = rc.Close()

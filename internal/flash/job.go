@@ -19,13 +19,15 @@ const (
 	ModeRaw          Mode = "raw"
 	ModeWindowsFAT32 Mode = "windows-fat32"
 	ModeISOFAT32     Mode = "iso-fat32"
+	ModeMultiboot    Mode = "multiboot"
 )
 
 // JobSpec defines all parameters for a single flash operation (serializable for privileged worker IPC).
 type JobSpec struct {
 	ImagePath       string           `json:"image_path"`
-	DevicePath      string           `json:"device_path"`
+	ImagePaths      []string         `json:"image_paths,omitempty"`
 	Mode            Mode             `json:"mode"`
+	DevicePath      string           `json:"device_path"`
 	VolumeLabel     string           `json:"volume_label,omitempty"`
 	Verify          bool             `json:"verify"`
 	IncludeFixedUSB bool             `json:"include_fixed_usb"`
@@ -48,7 +50,21 @@ type ProgressEvent struct {
 // ProgressSink receives structured progress updates during flashing.
 type ProgressSink func(ProgressEvent)
 
-// Execute validates the target drive & image, selects the effective mode, and flashes the USB drive.
+// EffectiveImages returns the normalized list of image paths for a JobSpec.
+func (s JobSpec) EffectiveImages() []string {
+	var out []string
+	for _, p := range s.ImagePaths {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 && s.ImagePath != "" {
+		out = append(out, s.ImagePath)
+	}
+	return out
+}
+
+// Execute validates the target drive & image(s), selects the effective mode, and flashes the USB drive.
 func Execute(ctx context.Context, spec JobSpec, sink ProgressSink) error {
 	emit := func(ev ProgressEvent) {
 		if sink != nil {
@@ -56,9 +72,9 @@ func Execute(ctx context.Context, spec JobSpec, sink ProgressSink) error {
 		}
 	}
 
-	info, err := image.Inspect(spec.ImagePath)
-	if err != nil {
-		return fmt.Errorf("inspect image: %w", err)
+	images := spec.EffectiveImages()
+	if len(images) == 0 {
+		return fmt.Errorf("no boot image specified")
 	}
 
 	drv, err := device.FindByPath(spec.DevicePath, device.ListOptions{
@@ -69,6 +85,25 @@ func Execute(ctx context.Context, spec JobSpec, sink ProgressSink) error {
 	}
 	if err := device.ValidateTarget(drv, spec.IncludeFixedUSB); err != nil {
 		return err
+	}
+
+	// Multi-distro Linux USB mode when 2+ images are provided or multiboot mode is explicitly selected.
+	if spec.Mode == ModeMultiboot || len(images) > 1 {
+		spec.ImagePaths = images
+		emit(ProgressEvent{
+			Phase:   "prepare",
+			Message: fmt.Sprintf("Unmounting and preparing %s (%s) for %d-distro multiboot...", drv.DevicePath, drv.DisplayLabel(), len(images)),
+		})
+		if err := device.PrepareForWrite(drv); err != nil {
+			return fmt.Errorf("prepare target drive: %w", err)
+		}
+		return flashMultibootToDrive(ctx, spec, drv, emit)
+	}
+
+	spec.ImagePath = images[0]
+	info, err := image.Inspect(spec.ImagePath)
+	if err != nil {
+		return fmt.Errorf("inspect image: %w", err)
 	}
 
 	effectiveMode := spec.Mode

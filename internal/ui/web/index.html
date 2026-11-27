@@ -163,6 +163,27 @@
   }
   .progress-bar.ok { background: var(--ok); }
   .progress-bar.err { background: var(--danger); }
+  .progress-bar.warn { background: #e6a23c; }
+  .iso-list {
+    margin-top: 10px;
+    display: none;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .iso-list.visible { display: flex; }
+  .iso-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 7px 10px;
+    border-radius: 8px;
+    background: #121521;
+    border: 1px solid var(--card-border);
+    font-size: 12.5px;
+  }
+  .iso-item .meta { color: var(--muted); font-size: 11.5px; }
+  .iso-item button { padding: 4px 9px; font-size: 12px; }
   .status-line {
     display: flex;
     justify-content: space-between;
@@ -252,13 +273,17 @@
   </div>
 
   <div class="card">
-    <div class="card-title"><span>2. Boot Image (.iso / .img / .gz / .bz2 / .zip)</span></div>
+    <div class="card-title">
+      <span>2. Boot Image(s) (.iso / .img / .gz / .bz2 / .zip)</span>
+      <button id="addMultiBtn" type="button" style="padding:4px 10px;font-size:11.5px;">+ Add Distro (Multiboot)</button>
+    </div>
     <div class="row">
       <input type="text" id="imagePath" placeholder="Select or paste full path to a Linux or Windows ISO / disk image..." />
       <button id="browseBtn" type="button">Browse...</button>
       <button id="inspectBtn" type="button">Inspect</button>
     </div>
     <div id="imageBadge" class="badge"></div>
+    <div id="multiList" class="iso-list"></div>
   </div>
 
   <div class="card">
@@ -269,6 +294,7 @@
         <select id="modeSelect">
           <option value="auto">Auto (Recommended)</option>
           <option value="raw">Raw Direct Stream (Linux / Hybrid ISO / IMG)</option>
+          <option value="multiboot">Multi-Distro Linux USB (UEFI Boot Menu)</option>
           <option value="windows-fat32">Windows GPT + FAT32 (Auto-Split WIM, Secure Boot)</option>
           <option value="iso-fat32">Standard ISO -> GPT + FAT32</option>
         </select>
@@ -331,9 +357,64 @@
 const TOKEN = "{{TOKEN}}";
 let drives = [];
 let inspected = null;
+let extraImages = []; // Additional Linux ISOs queued for Multi-Distro USB mode
 let flashing = false;
 
 const $ = (id) => document.getElementById(id);
+
+function formatBytesJS(b) {
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let v = Number(b) || 0, u = 0;
+  while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+  return (u >= 3 ? v.toFixed(2) : v.toFixed(1)) + " " + units[u];
+}
+
+function getAllSelectedImages() {
+  const list = [];
+  const primary = $("imagePath").value.trim();
+  if (primary) list.push(primary);
+  for (const item of extraImages) {
+    if (item.path && !list.includes(item.path)) list.push(item.path);
+  }
+  return list;
+}
+
+function renderMultiList() {
+  const box = $("multiList");
+  box.innerHTML = "";
+  if (extraImages.length === 0) {
+    box.className = "iso-list";
+    return;
+  }
+  box.className = "iso-list visible";
+  let totalBytes = inspected ? (inspected.size_bytes || 0) : 0;
+  extraImages.forEach((item, idx) => {
+    totalBytes += item.size_bytes || 0;
+    const row = document.createElement("div");
+    row.className = "iso-item";
+    const left = document.createElement("div");
+    left.innerHTML = "<strong>" + (idx + 2) + ". " + item.file_name + "</strong><div class='meta'>" + item.summary + " (" + item.size_human + ")</div>";
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.textContent = "Remove";
+    rm.disabled = flashing;
+    rm.onclick = () => {
+      extraImages.splice(idx, 1);
+      if (extraImages.length === 0 && $("modeSelect").value === "multiboot") {
+        $("modeSelect").value = "auto";
+      }
+      renderMultiList();
+    };
+    row.appendChild(left);
+    row.appendChild(rm);
+    box.appendChild(row);
+  });
+  const summary = document.createElement("div");
+  summary.className = "meta";
+  summary.style.marginTop = "2px";
+  summary.textContent = "Multiboot queue: " + getAllSelectedImages().length + " Linux ISOs • Total ~" + formatBytesJS(totalBytes + 64 * 1024 * 1024) + " (incl. 64 MiB UEFI boot menu)";
+  box.appendChild(summary);
+}
 
 function appendLog(line) {
   const box = $("logBox");
@@ -397,6 +478,7 @@ async function inspectImage() {
       $("volumeLabel").placeholder = info.volume_label;
     }
     appendLog("Inspected " + info.file_name + ": " + info.summary);
+    renderMultiList();
   } catch (e) {
     inspected = null;
     badge.textContent = "Error: " + e.message;
@@ -409,9 +491,14 @@ function setBusy(busy) {
   $("flashBtn").disabled = busy;
   $("refreshBtn").disabled = busy;
   $("browseBtn").disabled = busy;
+  $("addMultiBtn").disabled = busy;
   $("driveSelect").disabled = busy;
   $("imagePath").disabled = busy;
+  $("modeSelect").disabled = busy;
+  $("cancelBtn").disabled = false;
+  $("cancelBtn").textContent = "Cancel Flash";
   $("cancelBtn").classList.toggle("hidden", !busy);
+  renderMultiList();
 }
 
 $("refreshBtn").onclick = refreshDrives;
@@ -431,16 +518,46 @@ $("browseBtn").onclick = async () => {
   }
 };
 
+$("addMultiBtn").onclick = async () => {
+  try {
+    const res = await api("POST", "/api/pick-image", {});
+    if (!res.path) return;
+    if (!$("imagePath").value.trim()) {
+      $("imagePath").value = res.path;
+      await inspectImage();
+      return;
+    }
+    if (getAllSelectedImages().includes(res.path)) {
+      appendLog("ISO already in multiboot list: " + res.path);
+      return;
+    }
+    const info = await api("POST", "/api/inspect", { path: res.path });
+    if (info.kind === "windows-iso") {
+      appendLog("Note: Windows ISOs cannot be combined in Linux Multiboot mode.");
+      return;
+    }
+    extraImages.push(info);
+    $("modeSelect").value = "multiboot";
+    appendLog("Added to multiboot queue: " + info.file_name + " (" + info.size_human + ")");
+    renderMultiList();
+  } catch (e) {
+    appendLog("Could not add ISO: " + e.message);
+  }
+};
+
 $("flashBtn").onclick = () => {
   const devPath = $("driveSelect").value;
-  const imgPath = $("imagePath").value.trim();
+  const allImgs = getAllSelectedImages();
   if (!devPath) { appendLog("Please select a target USB drive first."); return; }
-  if (!imgPath) { appendLog("Please select a boot image file first."); return; }
+  if (allImgs.length === 0) { appendLog("Please select a boot image file first."); return; }
   const drv = drives.find(d => d.device_path === devPath);
+  const modeVal = allImgs.length > 1 ? "multiboot" : $("modeSelect").value;
   $("confirmDetails").textContent =
     "Device: " + (drv ? drv.display_label : devPath) + "\n" +
-    "Image:  " + imgPath + "\n" +
-    "Mode:   " + $("modeSelect").value;
+    (allImgs.length === 1
+      ? ("Image:  " + allImgs[0] + "\n")
+      : ("Images: " + allImgs.length + " Linux ISOs (Multiboot)\n  - " + allImgs.join("\n  - ") + "\n")) +
+    "Mode:   " + modeVal;
   $("confirmModal").classList.add("open");
 };
 
@@ -448,10 +565,13 @@ $("confirmCancel").onclick = () => $("confirmModal").classList.remove("open");
 
 $("confirmProceed").onclick = async () => {
   $("confirmModal").classList.remove("open");
+  const allImgs = getAllSelectedImages();
+  const modeVal = allImgs.length > 1 ? "multiboot" : $("modeSelect").value;
   const spec = {
-    image_path: $("imagePath").value.trim(),
+    image_path: allImgs[0] || "",
+    image_paths: allImgs,
     device_path: $("driveSelect").value,
-    mode: $("modeSelect").value,
+    mode: modeVal,
     volume_label: $("volumeLabel").value.trim(),
     verify: $("verifyCheck").checked,
     include_fixed_usb: $("includeFixed").checked,
@@ -481,9 +601,12 @@ $("confirmProceed").onclick = async () => {
 };
 
 $("cancelBtn").onclick = async () => {
+  $("cancelBtn").disabled = true;
+  $("cancelBtn").textContent = "Cancelling...";
+  $("statusMsg").textContent = "Stopping flash worker safely...";
   try {
     await api("POST", "/api/cancel", {});
-    appendLog("Cancellation requested...");
+    appendLog("Cancellation requested — stopping active write...");
   } catch (e) {}
 };
 
@@ -496,7 +619,7 @@ function connectEvents() {
   const es = new EventSource("/api/events?token=" + encodeURIComponent(TOKEN));
   es.onmessage = (msg) => {
     const ev = JSON.parse(msg.data);
-    if (ev.percent > 0) {
+    if (ev.percent > 0 && ev.phase !== "cancelled") {
       $("progBar").style.width = Math.min(100, ev.percent).toFixed(1) + "%";
       $("pctText").textContent = ev.percent.toFixed(1) + "%";
     }
@@ -509,10 +632,19 @@ function connectEvents() {
     if (ev.phase === "prepare" || ev.phase === "partition" || ev.phase === "splitting-wim" || ev.phase === "unattend" || ev.phase === "recovering" || ev.phase === "sync") {
       appendLog("[" + ev.phase + "] " + ev.message);
     }
-    if (ev.error) {
+    if (ev.phase === "cancelled") {
+      $("progBar").className = "progress-bar warn";
+      $("pctText").textContent = "Cancelled";
+      $("statusMsg").textContent = ev.message || "Flash cancelled by user";
+      $("speedText").textContent = "";
+      appendLog("CANCELLED: " + (ev.message || "Flash cancelled by user"));
+      setBusy(false);
+      refreshDrives();
+    } else if (ev.error) {
       $("progBar").className = "progress-bar err";
       $("pctText").textContent = "Failed";
       $("statusMsg").textContent = ev.error;
+      $("speedText").textContent = "";
       appendLog("ERROR: " + ev.error);
       setBusy(false);
     } else if (ev.done) {

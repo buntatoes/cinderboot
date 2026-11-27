@@ -6,6 +6,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/buntatoes/cinderboot/internal/device"
 	"github.com/buntatoes/cinderboot/internal/elevate"
@@ -150,11 +152,22 @@ func runInspect(args []string) {
 	}
 }
 
+type multiStringFlag []string
+
+func (m *multiStringFlag) String() string { return strings.Join(*m, ", ") }
+func (m *multiStringFlag) Set(val string) error {
+	if strings.TrimSpace(val) != "" {
+		*m = append(*m, strings.TrimSpace(val))
+	}
+	return nil
+}
+
 func runFlashCLI(args []string) {
 	fs := flag.NewFlagSet("flash", flag.ExitOnError)
-	imgPath := fs.String("image", "", "Path to ISO or disk image (required)")
+	var imgPaths multiStringFlag
+	fs.Var(&imgPaths, "image", "Path to ISO or disk image (repeatable for multi-distro Linux USB)")
 	devPath := fs.String("device", "", "Target USB device path or Windows drive letter (required)")
-	mode := fs.String("mode", "auto", "Flash mode: auto, raw, windows-fat32, iso-fat32")
+	mode := fs.String("mode", "auto", "Flash mode: auto, raw, windows-fat32, iso-fat32, multiboot")
 	label := fs.String("label", "", "FAT32 volume label (optional)")
 	verify := fs.Bool("verify", true, "Verify written bytes via SHA-256 read-back (raw mode)")
 	includeFixed := fs.Bool("include-fixed", false, "Allow targeting fixed USB HDDs/SSDs")
@@ -166,23 +179,35 @@ func runFlashCLI(args []string) {
 	winUser := fs.String("win-user", "", "Windows 11: optional local admin username")
 	_ = fs.Parse(args)
 
-	if *imgPath == "" || *devPath == "" {
-		fatalf("usage: cinderboot flash --image <path> --device <dev> [options]")
+	if len(imgPaths) == 0 || *devPath == "" {
+		fatalf("usage: cinderboot flash --image <path> [--image <path2> ...] --device <dev> [options]")
 	}
 
 	drv, err := device.FindByPath(*devPath, device.ListOptions{IncludeFixedUSB: *includeFixed})
 	if err != nil {
 		fatalf("%v", err)
 	}
-	info, err := image.Inspect(*imgPath)
-	if err != nil {
-		fatalf("inspect image: %v", err)
+
+	var inspected []image.Info
+	for _, p := range imgPaths {
+		info, err := image.Inspect(p)
+		if err != nil {
+			fatalf("inspect image %q: %v", p, err)
+		}
+		inspected = append(inspected, info)
 	}
 
 	if !*yes {
 		fmt.Printf("\nWARNING: ALL DATA ON THIS USB DRIVE WILL BE ERASED!\n")
 		fmt.Printf("  Target: %s\n", drv.DisplayLabel())
-		fmt.Printf("  Image:  %s (%s)\n", info.FileName, info.Summary)
+		if len(inspected) == 1 {
+			fmt.Printf("  Image:  %s (%s)\n", inspected[0].FileName, inspected[0].Summary)
+		} else {
+			fmt.Printf("  Mode:   Multi-Distro Linux UEFI USB (%d ISOs)\n", len(inspected))
+			for i, info := range inspected {
+				fmt.Printf("    %d. %s (%s)\n", i+1, info.FileName, device.FormatBytes(uint64(info.SizeBytes)))
+			}
+		}
 		fmt.Printf("Type ERASE to continue: ")
 		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 		if strings.TrimSpace(line) != "ERASE" {
@@ -195,7 +220,8 @@ func runFlashCLI(args []string) {
 	defer stop()
 
 	spec := flash.JobSpec{
-		ImagePath:       *imgPath,
+		ImagePath:       imgPaths[0],
+		ImagePaths:      []string(imgPaths),
 		DevicePath:      drv.DevicePath,
 		Mode:            flash.Mode(*mode),
 		VolumeLabel:     *label,
@@ -253,6 +279,7 @@ func runWorker(args []string) {
 	fs := flag.NewFlagSet("worker", flag.ExitOnError)
 	specPath := fs.String("spec", "", "Path to JSON job spec")
 	eventsPath := fs.String("events", "", "Optional JSONL output file (defaults to stdout)")
+	cancelPath := fs.String("cancel", "", "Optional cancel sentinel file watched for user cancellation")
 	_ = fs.Parse(args)
 
 	if *specPath == "" {
@@ -292,10 +319,49 @@ func runWorker(args []string) {
 		os.Exit(1)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	ctx, cancel := context.WithCancel(sigCtx)
+	defer cancel()
+
+	// Watch the user-owned cancel sentinel file so unprivileged UI parents can reliably cancel root/Admin workers.
+	if *cancelPath != "" {
+		go func() {
+			ticker := time.NewTicker(50 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					if _, err := os.Stat(*cancelPath); err == nil {
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	// Also watch stdin EOF when launched over a pipe (Linux pkexec/sudo).
+	if st, err := os.Stdin.Stat(); err == nil && (st.Mode()&os.ModeCharDevice) == 0 {
+		go func() {
+			var b [1]byte
+			_, _ = os.Stdin.Read(b[:])
+			cancel()
+		}()
+	}
 
 	if err := flash.Execute(ctx, spec, emit); err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			emit(flash.ProgressEvent{
+				Phase:   "cancelled",
+				Message: "Flash cancelled by user",
+				Error:   "Flash cancelled by user",
+				Done:    true,
+			})
+			os.Exit(130)
+		}
 		emit(flash.ProgressEvent{Phase: "error", Error: err.Error(), Done: true})
 		os.Exit(1)
 	}
@@ -347,9 +413,11 @@ func runInstallLinux() {
 	}
 
 	linkPath := filepath.Join(binDir, "cinderboot")
-	_ = os.Remove(linkPath)
-	if err := os.Symlink(dstBin, linkPath); err != nil {
-		fatalf("symlink %s: %v", linkPath, err)
+	if target, err := os.Readlink(linkPath); err != nil || target != dstBin {
+		_ = os.Remove(linkPath)
+		if err := os.Symlink(dstBin, linkPath); err != nil {
+			fatalf("symlink %s: %v", linkPath, err)
+		}
 	}
 
 	appIconPNG := filepath.Join(appDir, "icon.png")

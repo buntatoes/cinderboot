@@ -185,6 +185,284 @@ func WriteGPT(w io.WriteSeeker, diskSize uint64, sectorSize uint32, partitions [
 	return nil
 }
 
+// WipePartitionTables zeroes the leading and trailing regions (up to 1 MiB each)
+// of a target disk so stale MBR, Primary GPT, and old Backup GPT structures cannot
+// interfere with a freshly flashed image.
+func WipePartitionTables(w io.WriteSeeker, diskSize uint64, sectorSize uint32) error {
+	if sectorSize == 0 {
+		sectorSize = 512
+	}
+	if diskSize < uint64(sectorSize)*128 {
+		return nil
+	}
+	wipeLen := uint64(1024 * 1024) // 1 MiB covers MBR, GPT up to 2046 sectors, and tail backup GPT
+	if wipeLen*2 > diskSize {
+		wipeLen = (diskSize / 2 / uint64(sectorSize)) * uint64(sectorSize)
+	}
+	if wipeLen == 0 {
+		return nil
+	}
+	zeros := make([]byte, wipeLen)
+	if err := writeAt(w, 0, zeros); err != nil {
+		return fmt.Errorf("wipe leading partition area: %w", err)
+	}
+	tailOff := int64(diskSize - wipeLen)
+	if err := writeAt(w, tailOff, zeros); err != nil {
+		return fmt.Errorf("wipe trailing backup GPT area: %w", err)
+	}
+	if _, err := w.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind after partition wipe: %w", err)
+	}
+	return nil
+}
+
+// RelocateBackupGPT checks whether a raw-flashed disk contains a valid GPT whose
+// AlternateLBA does not sit at the physical end of the USB drive (common for hybrid
+// Linux ISOs such as Ubuntu 22.04/24.04+). When needed, it relocates the Backup GPT
+// header and partition entry array to the end of the disk, updates Primary GPT and
+// Protective MBR sizes/CRCs, and clears the stray mid-disk backup header so strict
+// UEFI firmwares recognize the EFI System Partition.
+func RelocateBackupGPT(rw io.ReadWriteSeeker, diskSize uint64, sectorSize uint32) (bool, error) {
+	if sectorSize == 0 {
+		sectorSize = 512
+	}
+	sec := uint64(sectorSize)
+	totalSectors := diskSize / sec
+	if totalSectors < 128 {
+		return false, nil
+	}
+
+	mbr := make([]byte, sec)
+	if err := readAt(rw, 0, mbr); err != nil {
+		return false, fmt.Errorf("read MBR: %w", err)
+	}
+	hdr := make([]byte, sec)
+	if err := readAt(rw, int64(sec), hdr); err != nil {
+		return false, fmt.Errorf("read primary GPT header: %w", err)
+	}
+	if string(hdr[0:8]) != "EFI PART" {
+		return false, nil
+	}
+
+	hdrSize := binary.LittleEndian.Uint32(hdr[12:16])
+	if hdrSize < 92 || uint64(hdrSize) > sec {
+		return false, nil
+	}
+
+	// Verify primary GPT header CRC32 before modifying anything.
+	gotHdrCRC := binary.LittleEndian.Uint32(hdr[16:20])
+	hdrCheck := append([]byte(nil), hdr[:hdrSize]...)
+	binary.LittleEndian.PutUint32(hdrCheck[16:20], 0)
+	if crc32.ChecksumIEEE(hdrCheck) != gotHdrCRC {
+		return false, nil
+	}
+
+	myLBA := binary.LittleEndian.Uint64(hdr[24:32])
+	oldAltLBA := binary.LittleEndian.Uint64(hdr[32:40])
+	firstUsable := binary.LittleEndian.Uint64(hdr[40:48])
+	oldLastUsable := binary.LittleEndian.Uint64(hdr[48:56])
+	partEntriesLBA := binary.LittleEndian.Uint64(hdr[72:80])
+	numEntries := binary.LittleEndian.Uint32(hdr[80:84])
+	entrySize := binary.LittleEndian.Uint32(hdr[84:88])
+	entriesCRC := binary.LittleEndian.Uint32(hdr[88:92])
+
+	if myLBA != 1 || numEntries == 0 || entrySize < 128 {
+		return false, nil
+	}
+
+	newAltLBA := totalSectors - 1
+	if oldAltLBA == newAltLBA {
+		return false, nil
+	}
+
+	entriesByteLen := uint64(numEntries) * uint64(entrySize)
+	if entriesByteLen > 4*1024*1024 {
+		return false, nil
+	}
+	entriesSectors := (entriesByteLen + sec - 1) / sec
+	if newAltLBA <= entriesSectors+2 {
+		return false, nil
+	}
+	newBackupEntriesLBA := newAltLBA - entriesSectors
+	newLastUsable := newBackupEntriesLBA - 1
+	if newLastUsable < oldLastUsable || newBackupEntriesLBA <= firstUsable {
+		return false, nil
+	}
+
+	// Read and verify the primary partition entry array.
+	paddedEntriesLen := entriesSectors * sec
+	entriesPadded := make([]byte, paddedEntriesLen)
+	if err := readAt(rw, int64(partEntriesLBA*sec), entriesPadded[:entriesByteLen]); err != nil {
+		return false, fmt.Errorf("read GPT partition entries: %w", err)
+	}
+	if crc32.ChecksumIEEE(entriesPadded[:entriesByteLen]) != entriesCRC {
+		return false, nil
+	}
+
+	var maxPartLastLBA uint64
+	for i := uint32(0); i < numEntries; i++ {
+		eb := entriesPadded[uint64(i)*uint64(entrySize) : uint64(i+1)*uint64(entrySize)]
+		allZero := true
+		for _, b := range eb[0:16] {
+			if b != 0 {
+				allZero = false
+				break
+			}
+		}
+		if allZero {
+			continue
+		}
+		pLast := binary.LittleEndian.Uint64(eb[40:48])
+		if pLast > newLastUsable {
+			return false, nil
+		}
+		if pLast > maxPartLastLBA {
+			maxPartLastLBA = pLast
+		}
+	}
+
+	// Build updated Primary GPT header.
+	primaryHdr := append([]byte(nil), hdr...)
+	binary.LittleEndian.PutUint64(primaryHdr[32:40], newAltLBA)
+	binary.LittleEndian.PutUint64(primaryHdr[48:56], newLastUsable)
+	binary.LittleEndian.PutUint32(primaryHdr[16:20], 0)
+	primaryCRC := crc32.ChecksumIEEE(primaryHdr[:hdrSize])
+	binary.LittleEndian.PutUint32(primaryHdr[16:20], primaryCRC)
+
+	// Build Backup GPT header at the physical end of the disk.
+	backupHdr := append([]byte(nil), primaryHdr...)
+	binary.LittleEndian.PutUint64(backupHdr[24:32], newAltLBA)
+	binary.LittleEndian.PutUint64(backupHdr[32:40], 1)
+	binary.LittleEndian.PutUint64(backupHdr[72:80], newBackupEntriesLBA)
+	binary.LittleEndian.PutUint32(backupHdr[16:20], 0)
+	backupCRC := crc32.ChecksumIEEE(backupHdr[:hdrSize])
+	binary.LittleEndian.PutUint32(backupHdr[16:20], backupCRC)
+
+	// Update Protective MBR (0xEE starting at LBA 1) sector count if present.
+	mbrUpdated := false
+	if mbr[510] == 0x55 && mbr[511] == 0xAA {
+		pmbrSectors := totalSectors - 1
+		if pmbrSectors > 0xFFFFFFFF {
+			pmbrSectors = 0xFFFFFFFF
+		}
+		for p := 0; p < 4; p++ {
+			off := 446 + p*16
+			partType := mbr[off+4]
+			startLBA := binary.LittleEndian.Uint32(mbr[off+8 : off+12])
+			if partType == 0xEE && startLBA == 1 {
+				binary.LittleEndian.PutUint32(mbr[off+12:off+16], uint32(pmbrSectors))
+				mbrUpdated = true
+			}
+		}
+	}
+
+	// Write backup partition entries and backup header at the end of the disk first.
+	if err := writeAt(rw, int64(newBackupEntriesLBA*sec), entriesPadded); err != nil {
+		return false, fmt.Errorf("write relocated backup GPT entries: %w", err)
+	}
+	if err := writeAt(rw, int64(newAltLBA*sec), backupHdr); err != nil {
+		return false, fmt.Errorf("write relocated backup GPT header: %w", err)
+	}
+	if err := writeAt(rw, int64(sec), primaryHdr); err != nil {
+		return false, fmt.Errorf("write updated primary GPT header: %w", err)
+	}
+	if mbrUpdated {
+		if err := writeAt(rw, 0, mbr); err != nil {
+			return false, fmt.Errorf("write updated protective MBR: %w", err)
+		}
+	}
+
+	// Clear the old mid-disk backup GPT header if it sits safely outside all partitions.
+	if oldAltLBA > maxPartLastLBA && oldAltLBA < newBackupEntriesLBA {
+		zeroSec := make([]byte, sec)
+		_ = writeAt(rw, int64(oldAltLBA*sec), zeroSec)
+	}
+
+	return true, nil
+}
+
+// NewRandomGUID generates a random RFC 4122 v4 GUID in Microsoft mixed-endian GPT layout.
+func NewRandomGUID() [16]byte {
+	return newRandomGUID()
+}
+
+// FormatGUID formats a mixed-endian GPT GUID as standard lowercase UUID string (for Linux PARTUUID).
+func FormatGUID(g [16]byte) string {
+	d1 := binary.LittleEndian.Uint32(g[0:4])
+	d2 := binary.LittleEndian.Uint16(g[4:6])
+	d3 := binary.LittleEndian.Uint16(g[6:8])
+	return fmt.Sprintf("%08x-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		d1, d2, d3, g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15])
+}
+
+// ParseGPTPartitions parses non-empty GPT partition entries from a disk image or hybrid ISO.
+func ParseGPTPartitions(r io.ReaderAt, totalSize int64, sectorSize uint32) ([]GPTPartition, error) {
+	if sectorSize == 0 {
+		sectorSize = 512
+	}
+	sec := int64(sectorSize)
+	if totalSize < sec*4 {
+		return nil, fmt.Errorf("image too small for GPT")
+	}
+	hdr := make([]byte, sec)
+	if _, err := r.ReadAt(hdr, sec); err != nil {
+		return nil, err
+	}
+	if string(hdr[0:8]) != "EFI PART" {
+		return nil, fmt.Errorf("missing EFI PART signature")
+	}
+	partEntriesLBA := binary.LittleEndian.Uint64(hdr[72:80])
+	numEntries := binary.LittleEndian.Uint32(hdr[80:84])
+	entrySize := binary.LittleEndian.Uint32(hdr[84:88])
+	if numEntries == 0 || entrySize < 128 || uint64(numEntries)*uint64(entrySize) > 4*1024*1024 {
+		return nil, fmt.Errorf("invalid GPT partition array geometry")
+	}
+	tableOff := int64(partEntriesLBA) * sec
+	tableLen := int64(numEntries) * int64(entrySize)
+	if tableOff < 0 || tableOff+tableLen > totalSize {
+		return nil, fmt.Errorf("GPT partition array exceeds image bounds")
+	}
+	buf := make([]byte, tableLen)
+	if _, err := r.ReadAt(buf, tableOff); err != nil {
+		return nil, err
+	}
+	var out []GPTPartition
+	for i := uint32(0); i < numEntries; i++ {
+		eb := buf[uint64(i)*uint64(entrySize) : uint64(i+1)*uint64(entrySize)]
+		var typeGUID, uniqGUID [16]byte
+		copy(typeGUID[:], eb[0:16])
+		if typeGUID == ([16]byte{}) {
+			continue
+		}
+		copy(uniqGUID[:], eb[16:32])
+		var u16 []uint16
+		for j := 0; j < 36; j++ {
+			c := binary.LittleEndian.Uint16(eb[56+j*2 : 58+j*2])
+			if c == 0 {
+				break
+			}
+			u16 = append(u16, c)
+		}
+		out = append(out, GPTPartition{
+			TypeGUID:   typeGUID,
+			UniqueGUID: uniqGUID,
+			FirstLBA:   binary.LittleEndian.Uint64(eb[32:40]),
+			LastLBA:    binary.LittleEndian.Uint64(eb[40:48]),
+			Attributes: binary.LittleEndian.Uint64(eb[48:56]),
+			Name:       string(utf16.Decode(u16)),
+		})
+	}
+	return out, nil
+}
+
+func readAt(r io.ReadSeeker, offset int64, buf []byte) error {
+	if _, err := r.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+	_, err := io.ReadFull(r, buf)
+	return err
+}
+
 func writeAt(w io.WriteSeeker, offset int64, data []byte) error {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {

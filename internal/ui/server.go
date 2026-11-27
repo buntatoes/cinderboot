@@ -7,6 +7,7 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -232,15 +233,28 @@ func (s *serverState) handleFlash(w http.ResponseWriter, r *http.Request) {
 			s.cancelFlash = nil
 			s.mu.Unlock()
 		}()
+		var sawTerminal bool
 		err := elevate.RunFlash(ctx, spec, func(ev flash.ProgressEvent) {
+			if ev.Done {
+				sawTerminal = true
+			}
 			s.broadcast(ev)
 		})
-		if err != nil {
-			s.broadcast(flash.ProgressEvent{
-				Phase: "error",
-				Error: err.Error(),
-				Done:  true,
-			})
+		if err != nil && !sawTerminal {
+			if errors.Is(err, context.Canceled) {
+				s.broadcast(flash.ProgressEvent{
+					Phase:   "cancelled",
+					Message: "Flash cancelled by user",
+					Error:   "Flash cancelled by user",
+					Done:    true,
+				})
+			} else {
+				s.broadcast(flash.ProgressEvent{
+					Phase: "error",
+					Error: err.Error(),
+					Done:  true,
+				})
+			}
 		}
 	}()
 
