@@ -7,6 +7,7 @@
 
   <p>
     <a href="https://github.com/buntatoes/cinderboot/releases/latest"><img src="https://img.shields.io/badge/release-v0.0.5-orange" alt="Release" /></a>
+    <a href="https://github.com/buntatoes/cinderboot/releases"><img src="https://img.shields.io/github/downloads/buntatoes/cinderboot/total?color=brightgreen&label=downloads" alt="Downloads" /></a>
     <img src="https://img.shields.io/badge/dependencies-0%20(Go%20stdlib)-brightgreen" alt="Zero Dependencies" />
     <img src="https://img.shields.io/badge/platform-Linux%20%7C%20Windows-blue" alt="Platform" />
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-blue" alt="GPL-3.0" /></a>
