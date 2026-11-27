@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+<policyconfig>
+  <vendor>Cinderboot</vendor>
+  <vendor_url>https://github.com/buntatoes/cinderboot</vendor_url>
+  <action id="com.buntatoes.cinderboot.flash">
+    <description>Write a bootable OS image to a removable USB drive</description>
+    <message>Authentication is required to write a bootable image to a removable USB drive</message>
+    <icon_name>cinderboot</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

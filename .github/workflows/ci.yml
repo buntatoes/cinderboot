@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Vet and test
+        run: |
+          go vet ./...
+          go test -v -race ./...
+      - name: Build static Linux and Windows binaries
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o cinderboot ./cmd/cinderboot
+          ./cinderboot --version
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o cinderboot.exe ./cmd/cinderboot
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Vet and test
+        run: |
+          go vet ./...
+          go test -v ./...
+      - name: Build Windows binary
+        run: |
+          $env:CGO_ENABLED="0"
+          go build -trimpath -ldflags="-s -w" -o cinderboot.exe ./cmd/cinderboot
+          .\cinderboot.exe --version

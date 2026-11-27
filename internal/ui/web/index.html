@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Cinderboot {{VERSION}}</title>
+<link rel="icon" type="image/svg+xml" href="/icon.svg" />
+<style>
+  :root {
+    --bg: #0f1016;
+    --card: #181a24;
+    --card-border: #272a3a;
+    --text: #eef0f6;
+    --muted: #98a0b5;
+    --accent: #ff6b2b;
+    --accent-hi: #ff9447;
+    --danger: #e5484d;
+    --ok: #30c48d;
+    --input-bg: #11131b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Ubuntu, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.45;
+  }
+  .wrap {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 20px 18px 28px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 18px;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .brand img { width: 42px; height: 42px; }
+  .brand h1 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: 0.2px; }
+  .brand .sub { font-size: 12px; color: var(--muted); }
+  .pill {
+    font-size: 11px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: #232636;
+    border: 1px solid var(--card-border);
+    color: var(--muted);
+  }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--card-border);
+    border-radius: 12px;
+    padding: 15px 16px;
+    margin-bottom: 14px;
+  }
+  .card-title {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+    color: var(--muted);
+    margin: 0 0 10px 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  select, input[type="text"] {
+    width: 100%;
+    padding: 9px 11px;
+    border-radius: 8px;
+    border: 1px solid var(--card-border);
+    background: var(--input-bg);
+    color: var(--text);
+    font-size: 13.5px;
+    outline: none;
+  }
+  select:focus, input[type="text"]:focus { border-color: var(--accent); }
+  button {
+    padding: 9px 14px;
+    border-radius: 8px;
+    border: 1px solid var(--card-border);
+    background: #242838;
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button:hover:not(:disabled) { background: #2d3247; }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.primary {
+    background: linear-gradient(135deg, #e04318, #ff7b32);
+    border: none;
+    color: #fff;
+    padding: 11px 22px;
+    font-size: 14px;
+  }
+  button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+  button.danger {
+    background: #3b1c20;
+    border-color: #6b252c;
+    color: #ff9a9e;
+  }
+  .grid2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+  .field label {
+    display: block;
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+  .check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    margin-top: 8px;
+    cursor: pointer;
+    user-select: none;
+  }
+  .check input { accent-color: var(--accent); width: 15px; height: 15px; }
+  .badge {
+    margin-top: 10px;
+    padding: 8px 11px;
+    border-radius: 8px;
+    background: #131622;
+    border: 1px solid #2a2f45;
+    font-size: 12.5px;
+    color: #cfd6ea;
+    display: none;
+  }
+  .badge.visible { display: block; }
+  .badge.win { border-color: #e06a2b; color: #ffd4b8; }
+  .progress-track {
+    width: 100%;
+    height: 12px;
+    background: #10121a;
+    border-radius: 999px;
+    overflow: hidden;
+    border: 1px solid var(--card-border);
+    margin: 8px 0;
+  }
+  .progress-bar {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #e04318, #ff9d3b);
+    transition: width 0.15s ease;
+  }
+  .progress-bar.ok { background: var(--ok); }
+  .progress-bar.err { background: var(--danger); }
+  .status-line {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12.5px;
+    color: var(--muted);
+  }
+  .log {
+    margin-top: 10px;
+    max-height: 140px;
+    overflow-y: auto;
+    background: #0b0c12;
+    border: 1px solid var(--card-border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11.5px;
+    color: #b7c0d8;
+    white-space: pre-wrap;
+  }
+  .actions {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 12px;
+  }
+  .modal-bg {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,0.72);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    z-index: 50;
+  }
+  .modal-bg.open { display: flex; }
+  .modal {
+    background: var(--card);
+    border: 1px solid #6b252c;
+    border-radius: 14px;
+    max-width: 460px;
+    width: 100%;
+    padding: 18px 20px;
+  }
+  .modal h2 { margin: 0 0 8px 0; color: #ff8c8f; font-size: 17px; }
+  .modal p { font-size: 13px; color: #d6dbea; margin: 8px 0; }
+  .modal .target-box {
+    background: #12141e;
+    border: 1px solid var(--card-border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-family: ui-monospace, monospace;
+    font-size: 12.5px;
+    margin: 10px 0 14px;
+  }
+  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">
+      <img src="/icon.svg" alt="Cinderboot" />
+      <div>
+        <h1>Cinderboot</h1>
+        <div class="sub">Cross-Platform Bootable USB Creator • Zero Dependencies • GPL-3.0</div>
+      </div>
+    </div>
+    <span class="pill">v{{VERSION}}</span>
+  </header>
+
+  <div class="card">
+    <div class="card-title">
+      <span>1. Target Removable USB Drive</span>
+      <label style="font-weight:400;text-transform:none;letter-spacing:0;display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="includeFixed" style="accent-color:var(--accent);" />
+        Show fixed USB HDDs
+      </label>
+    </div>
+    <div class="row">
+      <select id="driveSelect"></select>
+      <button id="refreshBtn" type="button">Refresh</button>
+    </div>
+    <div id="driveHint" style="font-size:12px;color:var(--muted);margin-top:6px;">
+      Internal OS, NVMe, and SATA drives are automatically hidden and write-protected.
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title"><span>2. Boot Image (.iso / .img / .gz / .bz2 / .zip)</span></div>
+    <div class="row">
+      <input type="text" id="imagePath" placeholder="Select or paste full path to a Linux or Windows ISO / disk image..." />
+      <button id="browseBtn" type="button">Browse...</button>
+      <button id="inspectBtn" type="button">Inspect</button>
+    </div>
+    <div id="imageBadge" class="badge"></div>
+  </div>
+
+  <div class="card">
+    <div class="card-title"><span>3. Flash Configuration</span></div>
+    <div class="grid2">
+      <div class="field">
+        <label for="modeSelect">Flash Mode</label>
+        <select id="modeSelect">
+          <option value="auto">Auto (Recommended)</option>
+          <option value="raw">Raw Direct Stream (Linux / Hybrid ISO / IMG)</option>
+          <option value="windows-fat32">Windows GPT + FAT32 (Auto-Split WIM, Secure Boot)</option>
+          <option value="iso-fat32">Standard ISO -> GPT + FAT32</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="volumeLabel">Volume Label (FAT32 Mode)</label>
+        <input type="text" id="volumeLabel" maxlength="11" placeholder="Auto from ISO (e.g. CINDERBOOT)" />
+      </div>
+    </div>
+    <label class="check">
+      <input type="checkbox" id="verifyCheck" checked />
+      Verify written bytes via SHA-256 read-back after flashing (Raw Mode)
+    </label>
+  </div>
+
+  <div class="card" id="winCard">
+    <div class="card-title"><span>4. Windows 10/11 Setup Customization (autounattend.xml)</span></div>
+    <label class="check"><input type="checkbox" id="winBypassReq" /> Bypass TPM 2.0, Secure Boot, and 4 GB RAM requirements</label>
+    <label class="check"><input type="checkbox" id="winBypassMSA" /> Remove Microsoft Account / Internet requirement (BypassNRO)</label>
+    <label class="check"><input type="checkbox" id="winNoBitlocker" /> Disable automatic BitLocker device encryption</label>
+    <label class="check"><input type="checkbox" id="winSkipPrivacy" /> Skip OOBE privacy questions</label>
+    <div class="field" style="margin-top:10px;">
+      <label for="winUser">Optional Local Administrator Username (leave blank to choose during setup)</label>
+      <input type="text" id="winUser" maxlength="20" placeholder="e.g. Admin" />
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-title"><span>Status &amp; Progress</span><span id="pctText">Idle</span></div>
+    <div class="progress-track"><div class="progress-bar" id="progBar"></div></div>
+    <div class="status-line">
+      <span id="statusMsg">Ready. Select a USB drive and boot image.</span>
+      <span id="speedText"></span>
+    </div>
+    <div class="log" id="logBox">Cinderboot v{{VERSION}} ready.</div>
+    <div class="actions">
+      <button id="quitBtn" type="button">Quit</button>
+      <div class="row">
+        <button id="cancelBtn" class="danger hidden" type="button">Cancel Flash</button>
+        <button id="flashBtn" class="primary" type="button">Flash USB Drive</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-bg" id="confirmModal">
+  <div class="modal">
+    <h2>Confirm Destructive Write</h2>
+    <p><strong>ALL EXISTING DATA</strong> on the selected USB drive will be permanently erased:</p>
+    <div class="target-box" id="confirmDetails"></div>
+    <p>You will be prompted by your OS for administrator/root permission to write to the USB device.</p>
+    <div class="modal-actions">
+      <button id="confirmCancel" type="button">Cancel</button>
+      <button id="confirmProceed" class="primary" type="button">Erase &amp; Flash</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const TOKEN = "{{TOKEN}}";
+let drives = [];
+let inspected = null;
+let flashing = false;
+
+const $ = (id) => document.getElementById(id);
+
+function appendLog(line) {
+  const box = $("logBox");
+  box.textContent += "\n" + line;
+  box.scrollTop = box.scrollHeight;
+}
+
+async function api(method, path, body) {
+  const opts = {
+    method,
+    headers: { "X-Cinderboot-Token": TOKEN }
+  };
+  if (body !== undefined) {
+    opts.headers["Content-Type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, opts);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+  return data;
+}
+
+async function refreshDrives() {
+  try {
+    const inc = $("includeFixed").checked ? "1" : "0";
+    drives = await api("GET", "/api/drives?include_fixed=" + inc);
+    const sel = $("driveSelect");
+    sel.innerHTML = "";
+    if (!drives || drives.length === 0) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No removable USB drives detected — plug in a USB stick and click Refresh";
+      sel.appendChild(opt);
+    } else {
+      for (const d of drives) {
+        const opt = document.createElement("option");
+        opt.value = d.device_path;
+        opt.textContent = d.display_label;
+        sel.appendChild(opt);
+      }
+    }
+  } catch (e) {
+    appendLog("Error listing drives: " + e.message);
+  }
+}
+
+async function inspectImage() {
+  const p = $("imagePath").value.trim();
+  const badge = $("imageBadge");
+  if (!p) {
+    badge.className = "badge";
+    inspected = null;
+    return;
+  }
+  try {
+    const info = await api("POST", "/api/inspect", { path: p });
+    inspected = info;
+    badge.textContent = info.summary + " (" + info.size_human + ")";
+    badge.className = "badge visible" + (info.kind === "windows-iso" ? " win" : "");
+    if (info.volume_label && !$("volumeLabel").value) {
+      $("volumeLabel").placeholder = info.volume_label;
+    }
+    appendLog("Inspected " + info.file_name + ": " + info.summary);
+  } catch (e) {
+    inspected = null;
+    badge.textContent = "Error: " + e.message;
+    badge.className = "badge visible";
+  }
+}
+
+function setBusy(busy) {
+  flashing = busy;
+  $("flashBtn").disabled = busy;
+  $("refreshBtn").disabled = busy;
+  $("browseBtn").disabled = busy;
+  $("driveSelect").disabled = busy;
+  $("imagePath").disabled = busy;
+  $("cancelBtn").classList.toggle("hidden", !busy);
+}
+
+$("refreshBtn").onclick = refreshDrives;
+$("includeFixed").onchange = refreshDrives;
+$("inspectBtn").onclick = inspectImage;
+$("imagePath").addEventListener("change", inspectImage);
+
+$("browseBtn").onclick = async () => {
+  try {
+    const res = await api("POST", "/api/pick-image", {});
+    if (res.path) {
+      $("imagePath").value = res.path;
+      await inspectImage();
+    }
+  } catch (e) {
+    appendLog("File picker note: " + e.message + " (paste the full path directly)");
+  }
+};
+
+$("flashBtn").onclick = () => {
+  const devPath = $("driveSelect").value;
+  const imgPath = $("imagePath").value.trim();
+  if (!devPath) { appendLog("Please select a target USB drive first."); return; }
+  if (!imgPath) { appendLog("Please select a boot image file first."); return; }
+  const drv = drives.find(d => d.device_path === devPath);
+  $("confirmDetails").textContent =
+    "Device: " + (drv ? drv.display_label : devPath) + "\n" +
+    "Image:  " + imgPath + "\n" +
+    "Mode:   " + $("modeSelect").value;
+  $("confirmModal").classList.add("open");
+};
+
+$("confirmCancel").onclick = () => $("confirmModal").classList.remove("open");
+
+$("confirmProceed").onclick = async () => {
+  $("confirmModal").classList.remove("open");
+  const spec = {
+    image_path: $("imagePath").value.trim(),
+    device_path: $("driveSelect").value,
+    mode: $("modeSelect").value,
+    volume_label: $("volumeLabel").value.trim(),
+    verify: $("verifyCheck").checked,
+    include_fixed_usb: $("includeFixed").checked,
+    unattend: {
+      bypass_requirements: $("winBypassReq").checked,
+      bypass_msa: $("winBypassMSA").checked,
+      disable_bitlocker: $("winNoBitlocker").checked,
+      skip_privacy: $("winSkipPrivacy").checked,
+      local_username: $("winUser").value.trim()
+    }
+  };
+  setBusy(true);
+  $("progBar").className = "progress-bar";
+  $("progBar").style.width = "0%";
+  $("pctText").textContent = "Starting...";
+  $("statusMsg").textContent = "Requesting elevated permissions...";
+  $("speedText").textContent = "";
+  appendLog("Starting flash to " + spec.device_path + "...");
+  try {
+    await api("POST", "/api/flash", spec);
+  } catch (e) {
+    appendLog("Flash failed to start: " + e.message);
+    $("progBar").className = "progress-bar err";
+    $("statusMsg").textContent = "Error: " + e.message;
+    setBusy(false);
+  }
+};
+
+$("cancelBtn").onclick = async () => {
+  try {
+    await api("POST", "/api/cancel", {});
+    appendLog("Cancellation requested...");
+  } catch (e) {}
+};
+
+$("quitBtn").onclick = async () => {
+  try { await api("POST", "/api/quit", {}); } catch (e) {}
+  window.close();
+};
+
+function connectEvents() {
+  const es = new EventSource("/api/events?token=" + encodeURIComponent(TOKEN));
+  es.onmessage = (msg) => {
+    const ev = JSON.parse(msg.data);
+    if (ev.percent > 0) {
+      $("progBar").style.width = Math.min(100, ev.percent).toFixed(1) + "%";
+      $("pctText").textContent = ev.percent.toFixed(1) + "%";
+    }
+    if (ev.message) {
+      $("statusMsg").textContent = ev.message;
+    }
+    if (ev.speed_bps > 0) {
+      $("speedText").textContent = (ev.speed_bps / (1024*1024)).toFixed(1) + " MiB/s";
+    }
+    if (ev.phase === "prepare" || ev.phase === "partition" || ev.phase === "splitting-wim" || ev.phase === "unattend" || ev.phase === "recovering" || ev.phase === "sync") {
+      appendLog("[" + ev.phase + "] " + ev.message);
+    }
+    if (ev.error) {
+      $("progBar").className = "progress-bar err";
+      $("pctText").textContent = "Failed";
+      $("statusMsg").textContent = ev.error;
+      appendLog("ERROR: " + ev.error);
+      setBusy(false);
+    } else if (ev.done) {
+      $("progBar").style.width = "100%";
+      $("progBar").className = "progress-bar ok";
+      $("pctText").textContent = "Done";
+      appendLog("SUCCESS: " + ev.message + (ev.sha256 ? (" (SHA-256: " + ev.sha256 + ")") : ""));
+      setBusy(false);
+      refreshDrives();
+    }
+  };
+}
+
+refreshDrives();
+connectEvents();
+</script>
+</body>
+</html>
